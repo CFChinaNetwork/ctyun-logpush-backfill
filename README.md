@@ -2,7 +2,7 @@
 
 Cloudflare Worker for historical log backfill to CDN partner log ingestion endpoint.
 
-**Fully independent** from production `ctyun-logpush`: dedicated queues, separate R2 prefix (`processed-backfill/`), rate-limited Sender (~1/10 of production throughput). Safe to deploy alongside production without any interference.
+**Fully independent** from production `ctyun-logpush`: dedicated queues, separate R2 prefix (`processed-backfill/`), rate-limited Sender at a fixed **~10 batches/s (= ~10,000 log lines/s)**. Safe to deploy alongside production without any interference.
 
 ## Use Case
 
@@ -141,16 +141,39 @@ The 4 backfill queues can be left as-is (empty and idle) — next backfill run w
 | `SEND_QUEUE_NAME` | Var | Must match `send-queue-backfill` |
 | `R2_BUCKET_NAME` | Var | Must match `[[r2_buckets]].bucket_name` |
 
-## Throughput Details
+## Throughput & Duration
 
-| Layer | Parameter | Effective Rate |
+The Sender is the binding constraint — **fixed at ~10 batches/s (= ~10,000 log lines/s)**, regardless of which domain or its normal traffic level. Controlled by `max_batch_size=2, max_concurrency=1` in `wrangler-backfill.toml`.
+
+**Duration formula**:
+```
+backfill_time ≈ total_log_lines_in_range / 10,000 lines/s
+```
+
+where `total_log_lines_in_range` = number of requests the domain actually served during `[A, B]`.
+
+### Examples
+
+| Scenario (domain's normal traffic × gap duration) | Log lines to replay | Backfill time |
 |---|---|---|
-| Producer (scheduled) | `BACKFILL_RATE=5` | 5 raw files enqueued per cron minute (batches produced per file varies with Logpush config + traffic) |
-| Parser | `max_concurrency=10` | Not a bottleneck; consumes parse-queue-backfill quickly |
-| **Sender (the binding constraint)** | `max_batch_size=2, max_concurrency=1` | **~10 batch/s ≈ 10,000 lines/s** (stable, no burst) |
-| Retry on failure | `retry_delay=30`, `max_retries=5` | 30s between retries, DLQ after 5 failures |
+| 1K req/s × 1h gap (small domain / off-peak) | 3.6M | ~6 min |
+| 10K req/s × 1h gap (medium domain) | 36M | ~1 h |
+| 100K req/s × 1h gap (large domain at peak) | 360M | ~10 h |
+| 100K req/s × 4h gap | 1.44B | ~40 h |
 
-**Why Sender is the bottleneck**: `max_concurrency=1` means at most 1 Sender worker instance processes at a time, so the entire pipeline is gated by how fast one consumer can POST `max_batch_size=2` messages (~200ms round-trip each batch). Tuning `BACKFILL_RATE` higher only grows the `send-queue-backfill` backlog; it does not make delivery faster. To accelerate delivery, adjust Sender's `max_batch_size` and/or `max_concurrency` in `wrangler-backfill.toml` (but understand that doing so increases load on the customer endpoint).
+### How to speed up
+
+If delivery is too slow, edit `wrangler-backfill.toml`:
+
+| Change | New rate | Multiplier |
+|---|---|---|
+| `max_batch_size=5, max_concurrency=1` | ~25 batch/s | 2.5× |
+| `max_batch_size=5, max_concurrency=2` | ~50 batch/s | 5× |
+| `max_batch_size=10, max_concurrency=2` | ~100 batch/s | 10× |
+
+Then `wrangler deploy --config wrangler-backfill.toml`.
+
+**⚠️ Confirm the customer's receiving endpoint can handle the higher load first.** The default slow rate is intentional — to stay gentle on the endpoint while production traffic is also flowing in. Tuning `BACKFILL_RATE` (the Producer rate) alone does NOT speed up delivery; it only grows the `send-queue-backfill` backlog.
 
 ## Design Rationale
 
