@@ -1,0 +1,113 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  ctyun-logpush-backfill — 历史日志补传专用 Worker
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 和生产 worker(ctyun-logpush)完全独立运行：
+#   - 独立 worker name: ctyun-logpush-backfill
+#   - 独立 queues: parse-queue-backfill / send-queue-backfill (含各自 DLQ)
+#   - 独立 R2 前缀: processed-backfill/ (生产写 processed/)
+#   - 共享 R2 bucket: cdn-logs-raw (对 raw 文件 logs/... 只读)
+#   - Sender 限速 max_concurrency=1, max_batch_size=2 → 约 10 batch/s
+#     (生产 128 batch/s 的 ~1/10，匀速不 burst)
+#
+# 一次性部署流程（见 README.md）：
+#   1. 改 account_id 和 BACKFILL_START/END_TIME
+#   2. wrangler queues create × 4
+#   3. wrangler secret put × 3 (CTYUN_*)
+#   4. wrangler deploy --config wrangler-backfill.toml
+#   5. 监控: curl https://.../backfill/status
+#   6. 完成后: wrangler delete --config wrangler-backfill.toml
+# ═══════════════════════════════════════════════════════════════════════════
+
+name                 = "ctyun-logpush-backfill"
+account_id           = "0297df3199a94c8082d099ac2212c40a"
+main                 = "src/index.js"
+compatibility_date   = "2026-03-27"
+compatibility_flags  = ["nodejs_compat"]
+workers_dev          = true                  # 开启 workers.dev 域名便于访问 /backfill/status
+preview_urls         = false
+
+# ─── R2 存储桶（与生产共享同一 bucket，通过前缀隔离）────────────────────────
+[[r2_buckets]]
+binding     = "RAW_BUCKET"
+bucket_name = "cdn-logs-raw"
+
+# ─── Queue 生产者 ─────────────────────────────────────────────────────────────
+[[queues.producers]]
+binding = "PARSE_QUEUE"
+queue   = "parse-queue-backfill"
+
+[[queues.producers]]
+binding = "SEND_QUEUE"
+queue   = "send-queue-backfill"
+
+# ─── Queue 消费者 ─────────────────────────────────────────────────────────────
+# Parser queue: 处理 raw file 的并发可以快（Parser 读 R2 + 解析 + 写 batch）
+[[queues.consumers]]
+queue              = "parse-queue-backfill"
+max_batch_size     = 3
+max_batch_timeout  = 10
+max_concurrency    = 10
+max_retries        = 2
+retry_delay        = 30
+dead_letter_queue  = "parse-dlq-backfill"
+
+# ⭐ Sender queue: 关键限速点（对接收端的实际冲击速率）
+# max_concurrency=1 保证同时只有 1 个 consumer 实例 → 严格匀速
+# max_batch_size=2 每批 2 条并发 send → 约 10 batch/s = 10,000 行/s = 生产的 ~1/10
+# retry_delay=30 失败时等 30s 再试 → 保护接收端不被重试风暴
+[[queues.consumers]]
+queue              = "send-queue-backfill"
+max_batch_size     = 2
+max_batch_timeout  = 5
+max_concurrency    = 1
+max_retries        = 5
+retry_delay        = 30
+dead_letter_queue  = "send-dlq-backfill"
+
+# ─── 环境变量 ─────────────────────────────────────────────────────────────────
+[vars]
+# ==== 必填：补传时间范围（两个精确时间点）====
+# 格式：ISO 8601
+#   UTC:      "2026-04-22T14:00:00Z"
+#   北京时间:  "2026-04-22T22:00:00+08:00"
+# 约束：
+#   - START 必须早于 END
+#   - END 必须 ≤ 现在（不能是未来）
+#   - 范围最大 48 小时（防误操作）
+#   - 匹配策略宽松交集：任何和 [A,B] 有时间重叠的文件都补传
+#     (Logpush 文件通常 5min 粒度，两端可能 0-5min 重复，客户监控一般可接受)
+BACKFILL_START_TIME = ""
+BACKFILL_END_TIME   = ""
+
+# ==== Producer 端速率 ====
+# 每次 Cron（每分钟）最多入队 raw files 数量
+# 默认 5: 每分钟入 5 个 raw file，Consumer 匀速 10 batch/s 消费，不会持续积压
+# Consumer 端是真正决定接收端速率的（max_concurrency=1）
+# 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（100K 容量内安全）
+# 补传总时长主要由 Consumer 速率决定 ≈ 40 hours for 4h 历史日志
+BACKFILL_RATE = "5"
+
+# ==== 可选开关 ====
+BACKFILL_ENABLED = "true"        # 设为 "false" 可暂停（redeploy 生效，state 保留）
+
+# ==== 与生产一致的参数 ====
+PARSE_QUEUE_NAME  = "parse-queue-backfill"
+SEND_QUEUE_NAME   = "send-queue-backfill"
+R2_BUCKET_NAME    = "cdn-logs-raw"
+BATCH_SIZE        = "1000"
+LOG_PREFIX        = "logs/"      # Logpush 写入 R2 的根路径前缀
+LOG_LEVEL         = "info"
+
+# ─── Cron 触发器 ─────────────────────────────────────────────────────────────
+[triggers]
+crons = ["* * * * *"]            # 每分钟扫描 R2 + rate-limited 入队
+
+[observability]
+[observability.logs]
+enabled         = true
+invocation_logs = true
+
+# ─── CPU 时间上限 ─────────────────────────────────────────────────────────────
+[limits]
+cpu_ms = 60000
