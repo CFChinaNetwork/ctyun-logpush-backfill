@@ -77,8 +77,8 @@ dead_letter_queue  = "send-dlq-backfill"
 #   - 范围最大 48 小时（防误操作）
 #   - 匹配策略宽松交集：任何和 [A,B] 有时间重叠的文件都补传
 #     (Logpush 文件通常 5min 粒度，两端可能 0-5min 重复，客户监控一般可接受)
-BACKFILL_START_TIME = ""
-BACKFILL_END_TIME   = ""
+BACKFILL_START_TIME = "2026-04-23T00:00:00Z"
+BACKFILL_END_TIME   = "2026-04-23T00:30:00Z"
 
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
