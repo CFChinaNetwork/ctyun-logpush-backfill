@@ -112,7 +112,13 @@ After `status=done` and `send-queue-backfill` backlog is drained:
 wrangler delete --config wrangler-backfill.toml
 ```
 
-Leftover R2 objects under `processed-backfill/` (empty `.done` markers from the Sender's idempotency mechanism) and `backfill-state/progress.json` can be manually removed via the CF Dashboard if desired. They are harmless to leave in place.
+### What's left behind in R2
+
+Same behavior as production: **after each successful HTTP POST**, Sender:
+1. Writes a tiny `.done` marker file (content = `"1"`, ~1 byte) under `processed-backfill/{safeKey}-{N}.txt.done` — used to prevent double-sending on Queue retry
+2. **Deletes** the original batch `.txt` file — no longer needed, saves R2 storage
+
+So when backfill completes, `processed-backfill/` contains only `.done` markers (tiny, no actual log data), plus `backfill-state/progress.json` (one state file). These can be manually removed via CF Dashboard / wrangler if desired, but are harmless to leave in place.
 
 The 4 backfill queues can be left as-is (empty and idle) — next backfill run will reuse them without re-creation.
 
