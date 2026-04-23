@@ -3,7 +3,7 @@
  *
  * 专用于补传指定时间范围 [BACKFILL_START_TIME, BACKFILL_END_TIME] 的 Logpush 日志。
  * 和生产 worker(ctyun-logpush)完全独立：独立 queues、独立 processed-backfill/ 前缀、
- * 独立 Sender 限速（max_concurrency=1 × max_batch_size=2 ≈ 10 batch/s 稳定匀速）。
+ * 独立 Sender 限速（max_concurrency=1 × max_batch_size=1 ≈ 5 batch/s 稳定匀速）。
  * 共享同一个 R2 bucket：只读 logs/ 前缀，写入独立的 processed-backfill/ 和 backfill-state/。
  *
  * Architecture:
@@ -11,7 +11,7 @@
  *                           ↓
  *                      Backfill Parser → processed-backfill/ → send-queue-backfill
  *                           ↓
- *                      Backfill Sender (max_concurrency=1, ~10 batch/s 匀速)
+ *                      Backfill Sender (max_concurrency=1, ~5 batch/s 匀速)
  *                           ↓
  *                      接收端服务器（与生产同一个 endpoint，共用同样的 CTYUN_* secrets）
  *
@@ -486,7 +486,7 @@ async function runEnqueue(env, state, config, startedAt) {
     state.status       = 'done';
     state.completed_at = new Date().toISOString();
     const durMin = Math.round((Date.parse(state.completed_at) - Date.parse(state.started_at)) / 60000);
-    log(env, 'info', `🎉 Backfill ENQUEUE COMPLETE! enqueued=${state.enqueued_count} files over ${durMin}min of cron activity. Backfill Parser/Sender will continue processing asynchronously at ~10 batch/s. Monitor send-queue-backfill backlog for actual delivery completion.`);
+    log(env, 'info', `🎉 Backfill ENQUEUE COMPLETE! enqueued=${state.enqueued_count} files over ${durMin}min of cron activity. Backfill Parser/Sender will continue processing asynchronously at ~5 batch/s. Monitor send-queue-backfill backlog for actual delivery completion.`);
   }
 
   return true;

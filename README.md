@@ -2,7 +2,7 @@
 
 Cloudflare Worker for historical log backfill to CDN partner log ingestion endpoint.
 
-**Fully independent** from production `ctyun-logpush`: dedicated queues, separate R2 prefix (`processed-backfill/`), rate-limited Sender at a fixed **~10 batches/s (= ~10,000 log lines/s)**. Safe to deploy alongside production without any interference.
+**Fully independent** from production `ctyun-logpush`: dedicated queues, separate R2 prefix (`processed-backfill/`), rate-limited Sender at a fixed **~5 batches/s (= ~5,000 log lines/s)**. Safe to deploy alongside production without any interference.
 
 ## Use Case
 
@@ -22,7 +22,7 @@ Backfill pipeline:
          ↓
   parse-queue-backfill → Parser → processed-backfill/
          ↓
-  send-queue-backfill → Sender (max_concurrency=1, ~10 batch/s)
+  send-queue-backfill → Sender (max_concurrency=1, max_batch_size=1, ~5 batch/s)
          ↓
   Customer log ingestion endpoint (same as production)
 ```
@@ -87,7 +87,7 @@ Key fields in status JSON:
 
 **Important**: `status=done` means all raw files have been **enqueued**. Actual delivery to customer is asynchronous via the rate-limited Sender. Monitor `send-queue-backfill` backlog drain for real completion.
 
-Delivery time = `total_batches ÷ ~10 batch/s`, where `total_batches ≈ enqueued_count × avg_batches_per_file`. `avg_batches_per_file` depends on your Logpush `max_upload_records` setting and actual traffic (default 100K records = 100 batches at `BATCH_SIZE=1000`, but small files with low traffic may produce far fewer). Watch the CF Dashboard → Queues → `send-queue-backfill` panel for real-time backlog.
+Delivery time = `total_batches ÷ ~5 batch/s`, where `total_batches ≈ enqueued_count × avg_batches_per_file`. `avg_batches_per_file` depends on your Logpush `max_upload_records` setting and actual traffic (default 100K records = 100 batches at `BATCH_SIZE=1000`, but small files with low traffic may produce far fewer). Watch the CF Dashboard → Queues → `send-queue-backfill` panel for real-time backlog.
 
 ## Pausing / Resuming
 
@@ -143,11 +143,17 @@ The 4 backfill queues can be left as-is (empty and idle) — next backfill run w
 
 ## Throughput & Duration
 
-The Sender is the binding constraint — **fixed at ~10 batches/s (= ~10,000 log lines/s)**, regardless of which domain or its normal traffic level. Controlled by `max_batch_size=2, max_concurrency=1` in `wrangler-backfill.toml`.
+The Sender is the binding constraint — **fixed at ~5 batches/s (= ~5,000 log lines/s)**, regardless of which domain or its normal traffic level. Controlled by `max_batch_size=1, max_concurrency=1` in `wrangler-backfill.toml`.
+
+Per the customer-supplied formula `concurrency × requests/sec × lines/request`:
+
+```
+1 concurrent POST × ~5 req/s × 1,000 lines/request = 5,000 lines/s
+```
 
 **Duration formula**:
 ```
-backfill_time ≈ total_log_lines_in_range / 10,000 lines/s
+backfill_time ≈ total_log_lines_in_range / 5,000 lines/s
 ```
 
 where `total_log_lines_in_range` = number of requests the domain actually served during `[A, B]`.
@@ -156,10 +162,10 @@ where `total_log_lines_in_range` = number of requests the domain actually served
 
 | Scenario (domain's normal traffic × gap duration) | Log lines to replay | Backfill time |
 |---|---|---|
-| 1K req/s × 1h gap (small domain / off-peak) | 3.6M | ~6 min |
-| 10K req/s × 1h gap (medium domain) | 36M | ~1 h |
-| 100K req/s × 1h gap (large domain at peak) | 360M | ~10 h |
-| 100K req/s × 4h gap | 1.44B | ~40 h |
+| 1K req/s × 1h gap (small domain / off-peak) | 3.6M | ~12 min |
+| 10K req/s × 1h gap (medium domain) | 36M | ~2 h |
+| 100K req/s × 1h gap (large domain at peak) | 360M | ~20 h |
+| 100K req/s × 4h gap | 1.44B | ~80 h |
 
 ### How to speed up
 
@@ -167,9 +173,10 @@ If delivery is too slow, edit `wrangler-backfill.toml`:
 
 | Change | New rate | Multiplier |
 |---|---|---|
-| `max_batch_size=5, max_concurrency=1` | ~25 batch/s | 2.5× |
-| `max_batch_size=5, max_concurrency=2` | ~50 batch/s | 5× |
-| `max_batch_size=10, max_concurrency=2` | ~100 batch/s | 10× |
+| `max_batch_size=2, max_concurrency=1` | ~10 batch/s | 2× |
+| `max_batch_size=5, max_concurrency=1` | ~25 batch/s | 5× |
+| `max_batch_size=5, max_concurrency=2` | ~50 batch/s | 10× |
+| `max_batch_size=10, max_concurrency=2` | ~100 batch/s | 20× |
 
 Then `wrangler deploy --config wrangler-backfill.toml`.
 
@@ -200,7 +207,7 @@ A: No. `END_TIME` must be ≤ current time. Attempting future time returns a val
 A: The worker will scan R2 and find zero matching files, resulting in `status=done` with `enqueued_count=0`. Check that files actually exist for your range under `logs/YYYYMMDD/`.
 
 **Q: How do I know when real delivery (not just enqueue) is complete?**
-A: When `send-queue-backfill` is empty. Check via CF Dashboard → Queues. Total time ≈ `(enqueued_count × avg_batches_per_file) ÷ 10 batch/s` — varies significantly with your Logpush file sizes.
+A: When `send-queue-backfill` is empty. Check via CF Dashboard → Queues. Total time ≈ `(enqueued_count × avg_batches_per_file) ÷ 5 batch/s` — varies significantly with your Logpush file sizes.
 
 ## Related
 

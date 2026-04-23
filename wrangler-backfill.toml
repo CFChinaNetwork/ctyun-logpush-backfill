@@ -7,8 +7,8 @@
 #   - 独立 queues: parse-queue-backfill / send-queue-backfill (含各自 DLQ)
 #   - 独立 R2 前缀: processed-backfill/ (生产写 processed/)
 #   - 共享 R2 bucket: cdn-logs-raw (对 raw 文件 logs/... 只读)
-#   - Sender 限速 max_concurrency=1, max_batch_size=2 → 固定 ~10 batch/s
-#     (= 10,000 log lines/s，与域名流量无关；匀速不 burst)
+#   - Sender 限速 max_concurrency=1, max_batch_size=1 → 固定 ~5 batch/s
+#     (= 5,000 log lines/s，与域名流量无关；匀速不 burst)
 #
 # 一次性部署流程（见 README.md）：
 #   1. 改 account_id 和 BACKFILL_START/END_TIME
@@ -54,12 +54,12 @@ dead_letter_queue  = "parse-dlq-backfill"
 
 # ⭐ Sender queue: 关键限速点（对接收端的实际冲击速率）
 # max_concurrency=1 保证同时只有 1 个 consumer 实例 → 严格匀速
-# max_batch_size=2 每批 2 条并发 send → 固定约 10 batch/s = 10,000 行/s（与域名流量无关）
+# max_batch_size=1 每批 1 条 send → 固定约 5 batch/s = 5,000 行/s（与域名流量无关）
 # retry_delay=30 失败时等 30s 再试 → 保护接收端不被重试风暴
 # 若需加速可调大 max_batch_size/max_concurrency，但需先与客户接收端确认承压能力
 [[queues.consumers]]
 queue              = "send-queue-backfill"
-max_batch_size     = 2
+max_batch_size     = 1
 max_batch_timeout  = 5
 max_concurrency    = 1
 max_retries        = 5
@@ -83,10 +83,10 @@ BACKFILL_END_TIME   = ""
 
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
-# 默认 5: 每分钟入 5 个 raw file；Consumer 匀速 ~10 batch/s 消费（上限由 consumer 决定）
-# Consumer 端的 max_concurrency=1 才是真正决定接收端冲击速率的参数
+# 默认 5: 每分钟入 5 个 raw file；Consumer 匀速 ~5 batch/s 消费（上限由 consumer 决定）
+# Consumer 端的 max_concurrency=1 + max_batch_size=1 才是真正决定接收端冲击速率的参数
 # 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（CF Queue 100K 容量内安全）
-# 补传总时长 = 总 batches ÷ ~10 batch/s，具体取决于 Logpush 文件数量和每文件大小
+# 补传总时长 = 总 batches ÷ ~5 batch/s，具体取决于 Logpush 文件数量和每文件大小
 BACKFILL_RATE = "5"
 
 # ==== 可选开关 ====
