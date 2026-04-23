@@ -259,7 +259,9 @@ async function sendBatch(msg, env) {
     return;
   }
   const object = await env.RAW_BUCKET.get(key);
-  if (!object) { log(env, 'warn', `Batch not found (may be sent or rolled back): ${key}`); return; }
+  if (!object) {
+    throw new Error(`Batch missing before successful send: ${key} (no .done marker present)`);
+  }
   const uri        = env.CTYUN_URI_EDGE;
   const endpoint   = env.CTYUN_ENDPOINT;
   const privateKey = env.CTYUN_PRIVATE_KEY;
@@ -282,15 +284,20 @@ async function sendBatch(msg, env) {
   }
   await resp.body?.cancel().catch(() => {});
   log(env, 'info', `Sent ${object.size ?? '?'} bytes (uncompressed) → HTTP ${resp.status} | ${key}`);
+  let wroteDone = false;
   await env.RAW_BUCKET.put(`${key}.done`, '1', {
     httpMetadata: { contentType: 'text/plain' },
+  }).then(() => {
+    wroteDone = true;
   }).catch((e) => {
-    log(env, 'warn', `Done marker write failed (may cause duplicate on retry): ${key}: ${e.message}`);
+    log(env, 'warn', `Done marker write failed (keeping batch file for investigation): ${key}: ${e.message}`);
   });
-  await env.RAW_BUCKET.delete(key).catch((e) => {
-    log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${e.message}`);
-  });
-  log(env, 'debug', `Deleted: ${key}`);
+  if (wroteDone) {
+    await env.RAW_BUCKET.delete(key).catch((e) => {
+      log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${e.message}`);
+    });
+    log(env, 'debug', `Deleted: ${key}`);
+  }
 }
 
 // ─── Scheduled handler: 扫 R2 logs/ → rate-limited 入 parse-queue-backfill ──
