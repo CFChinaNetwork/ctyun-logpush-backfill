@@ -85,7 +85,9 @@ Key fields in status JSON:
 - `enqueue_progress`: per-day-prefix progress
 - `completed_at`: timestamp when enqueue phase finished
 
-**Important**: `status=done` means all files have been **enqueued**. Actual delivery to customer is asynchronous via the rate-limited Sender. Monitor `send-queue-backfill` backlog for real completion. At ~10 batch/s, 4h of history ≈ 40h total delivery time.
+**Important**: `status=done` means all raw files have been **enqueued**. Actual delivery to customer is asynchronous via the rate-limited Sender. Monitor `send-queue-backfill` backlog drain for real completion.
+
+Delivery time = `total_batches ÷ ~10 batch/s`, where `total_batches ≈ enqueued_count × avg_batches_per_file`. `avg_batches_per_file` depends on your Logpush `max_upload_records` setting and actual traffic (default 100K records = 100 batches at `BATCH_SIZE=1000`, but small files with low traffic may produce far fewer). Watch the CF Dashboard → Queues → `send-queue-backfill` panel for real-time backlog.
 
 ## Pausing / Resuming
 
@@ -104,25 +106,15 @@ Alternatively, manually delete R2 object `backfill-state/progress.json`.
 
 ## Cleanup
 
-After status=done and send-queue-backfill backlog drained:
+After `status=done` and `send-queue-backfill` backlog is drained:
 
 ```bash
-# 1. Remove the worker
 wrangler delete --config wrangler-backfill.toml
-
-# 2. (Optional) Clean up leftover R2 files via Dashboard or CLI:
-#    - processed-backfill/  (should be empty after successful sends; Sender deletes on success)
-#    - backfill-state/progress.json  (state file)
-#    - *.done markers in processed-backfill/ (left by Sender as idempotency markers)
 ```
 
-The 4 backfill queues can be left as-is (they're empty when done) or deleted:
-```bash
-wrangler queues delete parse-queue-backfill
-wrangler queues delete send-queue-backfill
-wrangler queues delete parse-dlq-backfill
-wrangler queues delete send-dlq-backfill
-```
+Leftover R2 objects under `processed-backfill/` (empty `.done` markers from the Sender's idempotency mechanism) and `backfill-state/progress.json` can be manually removed via the CF Dashboard if desired. They are harmless to leave in place.
+
+The 4 backfill queues can be left as-is (empty and idle) — next backfill run will reuse them without re-creation.
 
 ## Environment Variables
 
@@ -147,10 +139,12 @@ wrangler queues delete send-dlq-backfill
 
 | Layer | Parameter | Effective Rate |
 |---|---|---|
-| Producer (scheduled) | `BACKFILL_RATE=5` files/min | ~8 batch/s into send-queue-backfill |
-| Sender Consumer | `max_batch_size=2, max_concurrency=1` | **~10 batch/s stable** (the binding constraint) |
+| Producer (scheduled) | `BACKFILL_RATE=5` | 5 raw files enqueued per cron minute (batches produced per file varies with Logpush config + traffic) |
+| Parser | `max_concurrency=10` | Not a bottleneck; consumes parse-queue-backfill quickly |
+| **Sender (the binding constraint)** | `max_batch_size=2, max_concurrency=1` | **~10 batch/s ≈ 10,000 lines/s** (stable, no burst) |
 | Retry on failure | `retry_delay=30`, `max_retries=5` | 30s between retries, DLQ after 5 failures |
-| Equivalent throughput | ~10,000 lines/s = ~1/10 of production (128K lines/s) |
+
+**Why Sender is the bottleneck**: `max_concurrency=1` means at most 1 Sender worker instance processes at a time, so the entire pipeline is gated by how fast one consumer can POST `max_batch_size=2` messages (~200ms round-trip each batch). Tuning `BACKFILL_RATE` higher only grows the `send-queue-backfill` backlog; it does not make delivery faster. To accelerate delivery, adjust Sender's `max_batch_size` and/or `max_concurrency` in `wrangler-backfill.toml` (but understand that doing so increases load on the customer endpoint).
 
 ## Design Rationale
 
@@ -177,7 +171,7 @@ A: No. `END_TIME` must be ≤ current time. Attempting future time returns a val
 A: The worker will scan R2 and find zero matching files, resulting in `status=done` with `enqueued_count=0`. Check that files actually exist for your range under `logs/YYYYMMDD/`.
 
 **Q: How do I know when real delivery (not just enqueue) is complete?**
-A: When `send-queue-backfill` is empty. Check via CF Dashboard or Queues API. At ~10 batch/s, 4h history ≈ 40h total delivery time.
+A: When `send-queue-backfill` is empty. Check via CF Dashboard → Queues. Total time ≈ `(enqueued_count × avg_batches_per_file) ÷ 10 batch/s` — varies significantly with your Logpush file sizes.
 
 ## Related
 

@@ -77,25 +77,27 @@ dead_letter_queue  = "send-dlq-backfill"
 #   - 范围最大 48 小时（防误操作）
 #   - 匹配策略宽松交集：任何和 [A,B] 有时间重叠的文件都补传
 #     (Logpush 文件通常 5min 粒度，两端可能 0-5min 重复，客户监控一般可接受)
-BACKFILL_START_TIME = "2026-04-23T00:00:00Z"
-BACKFILL_END_TIME   = "2026-04-23T00:30:00Z"
+BACKFILL_START_TIME = ""
+BACKFILL_END_TIME   = ""
 
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
-# 默认 5: 每分钟入 5 个 raw file，Consumer 匀速 10 batch/s 消费，不会持续积压
-# Consumer 端是真正决定接收端速率的（max_concurrency=1）
-# 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（100K 容量内安全）
-# 补传总时长主要由 Consumer 速率决定 ≈ 40 hours for 4h 历史日志
+# 默认 5: 每分钟入 5 个 raw file；Consumer 匀速 ~10 batch/s 消费（上限由 consumer 决定）
+# Consumer 端的 max_concurrency=1 才是真正决定接收端冲击速率的参数
+# 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（CF Queue 100K 容量内安全）
+# 补传总时长 = 总 batches ÷ ~10 batch/s，具体取决于 Logpush 文件数量和每文件大小
 BACKFILL_RATE = "5"
 
 # ==== 可选开关 ====
 BACKFILL_ENABLED = "true"        # 设为 "false" 可暂停（redeploy 生效，state 保留）
 
-# ==== 与生产一致的参数 ====
+# ==== 其他参数 ====
+# 下面 queue/bucket 名字需和本文件 [[queues.*]] / [[r2_buckets]] 的定义一致
+# 代码通过 binding (PARSE_QUEUE, SEND_QUEUE, RAW_BUCKET) 访问资源，这些 NAME 仅用于日志显示
 PARSE_QUEUE_NAME  = "parse-queue-backfill"
 SEND_QUEUE_NAME   = "send-queue-backfill"
 R2_BUCKET_NAME    = "cdn-logs-raw"
-BATCH_SIZE        = "1000"
+BATCH_SIZE        = "1000"       # 每批 lines 数，与生产 worker 一致
 LOG_PREFIX        = "logs/"      # Logpush 写入 R2 的根路径前缀
 LOG_LEVEL         = "info"
 

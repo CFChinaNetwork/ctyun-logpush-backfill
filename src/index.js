@@ -3,16 +3,17 @@
  *
  * 专用于补传指定时间范围 [BACKFILL_START_TIME, BACKFILL_END_TIME] 的 Logpush 日志。
  * 和生产 worker(ctyun-logpush)完全独立：独立 queues、独立 processed-backfill/ 前缀、
- * 独立限速（~生产的 1/10）。共享同一个 R2 bucket（raw logs 只读）。
+ * 独立 Sender 限速（max_concurrency=1 × max_batch_size=2 ≈ 10 batch/s 稳定匀速）。
+ * 共享同一个 R2 bucket：只读 logs/ 前缀，写入独立的 processed-backfill/ 和 backfill-state/。
  *
  * Architecture:
  *   scheduled(每分钟) → 扫 R2 logs/ → rate-limited 入 parse-queue-backfill
  *                           ↓
  *                      Backfill Parser → processed-backfill/ → send-queue-backfill
  *                           ↓
- *                      Backfill Sender (max_concurrency=1, ~10 batch/s)
+ *                      Backfill Sender (max_concurrency=1, ~10 batch/s 匀速)
  *                           ↓
- *                      接收端服务器（与生产同一个）
+ *                      接收端服务器（与生产同一个 endpoint，共用同样的 CTYUN_* secrets）
  *
  * Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
  * Env Vars    : BATCH_SIZE, LOG_LEVEL, LOG_PREFIX, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
@@ -325,7 +326,9 @@ function parseConfig(env) {
   if (startMs >= endMs) {
     return { valid: false, error: `START (${start}) must be earlier than END (${end}).` };
   }
-  // 安全校验：END 不能是未来时间（防止误删实时 processed-backfill/ 数据，虽然和生产前缀不同）
+  // 安全校验：END 不能是未来时间
+  // backfill 的目的是"补历史缺漏"，END > now 通常是误配置（如误填年份）
+  // 独立架构下 backfill 不删任何文件，所以 END 未来也不会破坏数据，但拒绝明显误配是好习惯
   const now = Date.now();
   if (endMs > now) {
     const futureMin = ((endMs - now) / 60000).toFixed(1);
@@ -434,11 +437,10 @@ async function runEnqueue(env, state, config, startedAt) {
         const range = extractFileTimeRange(key);
         if (!range) continue;
 
-        // ⭐ 早停：R2 list 按字典序返回 key，Logpush 文件名格式 YYYYMMDDTHHMMSSZ_...
-        //    字典序 == 时间序，因此一旦扫到 key.startMs > config.endMs，
-        //    后续所有 key 的时间都会超 END。立即标记该 prefix 完成，避免
-        //    scheduled handler 继续扫到 prefix 末尾（可能是几小时 / 几万文件）。
-        //    功能等价但省大量 R2 list 调用 + cron wall time。
+        // 早停优化：R2 list 按字典序返回 key，Logpush 文件名格式 YYYYMMDDTHHMMSSZ_...
+        // 字典序 == 时间序，因此一旦扫到 key.startMs > config.endMs，后续所有 key 都会超 END。
+        // 立即标记该 prefix 完成，避免继续扫描已知无关的文件。
+        // 影响量化：对小范围补传（~百 files）收益在毫秒级；对 1000+ files 场景避免多次 R2 list 分页。
         if (range.startMs > config.endMs) {
           prog.done = true;
           log(env, 'debug', `[Enqueue] Early termination at ${key} (startMs > endMs), prefix=${prefix}`);
