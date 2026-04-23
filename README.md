@@ -2,7 +2,7 @@
 
 Cloudflare Worker for historical log backfill to CDN partner log ingestion endpoint.
 
-**Fully independent** from production `ctyun-logpush`: dedicated queues, separate R2 prefix (`processed-backfill/`), rate-limited Sender at a fixed **~5 batches/s (= ~5,000 log lines/s)**. Safe to deploy alongside production without any interference.
+**Fully independent** from production `ctyun-logpush`: dedicated queues, separate R2 prefix (`processed-backfill/`), rate-limited Sender hard-capped at **≤ 5 batches/s (= ≤ 5,000 log lines/s)** via a code-level throttle — the ceiling holds even if the receiving endpoint responds faster than expected. Safe to deploy alongside production without any interference.
 
 ## Use Case
 
@@ -22,7 +22,7 @@ Backfill pipeline:
          ↓
   parse-queue-backfill → Parser → processed-backfill/
          ↓
-  send-queue-backfill → Sender (max_concurrency=1, max_batch_size=1, ~5 batch/s)
+  send-queue-backfill → Sender (max_concurrency=1, max_batch_size=1, throttled ≤ 5 batch/s)
          ↓
   Customer log ingestion endpoint (same as production)
 ```
@@ -87,7 +87,7 @@ Key fields in status JSON:
 
 **Important**: `status=done` means all raw files have been **enqueued**. Actual delivery to customer is asynchronous via the rate-limited Sender. Monitor `send-queue-backfill` backlog drain for real completion.
 
-Delivery time = `total_batches ÷ ~5 batch/s`, where `total_batches ≈ enqueued_count × avg_batches_per_file`. `avg_batches_per_file` depends on your Logpush `max_upload_records` setting and actual traffic (default 100K records = 100 batches at `BATCH_SIZE=1000`, but small files with low traffic may produce far fewer). Watch the CF Dashboard → Queues → `send-queue-backfill` panel for real-time backlog.
+Delivery time ≥ `total_batches ÷ 5 batch/s` (lower bound; actual may be longer if the endpoint is slower than the 200ms-per-invocation floor). `total_batches ≈ enqueued_count × avg_batches_per_file`. `avg_batches_per_file` depends on your Logpush `max_upload_records` setting and actual traffic (default 100K records = 100 batches at `BATCH_SIZE=1000`, but small files with low traffic may produce far fewer). Watch the CF Dashboard → Queues → `send-queue-backfill` panel for real-time backlog.
 
 ## Pausing / Resuming
 
@@ -143,17 +143,23 @@ The 4 backfill queues can be left as-is (empty and idle) — next backfill run w
 
 ## Throughput & Duration
 
-The Sender is the binding constraint — **fixed at ~5 batches/s (= ~5,000 log lines/s)**, regardless of which domain or its normal traffic level. Controlled by `max_batch_size=1, max_concurrency=1` in `wrangler-backfill.toml`.
+The Sender is hard-capped at **≤ 5 batches/s (= ≤ 5,000 log lines/s)**, regardless of which domain, its normal traffic level, or how fast the receiving endpoint responds.
+
+**How the cap is enforced** (two layers):
+1. **Config layer** (`wrangler-backfill.toml`): `max_batch_size=1, max_concurrency=1` → serial, single-message processing, no burst
+2. **Code layer** (`src/index.js`): `handleSendQueue` ensures each invocation takes at least 200ms (`MIN_SENDER_INVOCATION_MS`); if `sendBatch` finishes faster, it sleeps the remainder. This guarantees the cap even when the endpoint replies very quickly.
 
 Per the customer-supplied formula `concurrency × requests/sec × lines/request`:
 
 ```
-1 concurrent POST × ~5 req/s × 1,000 lines/request = 5,000 lines/s
+1 concurrent POST × ≤ 5 req/s × 1,000 lines/request = ≤ 5,000 lines/s
 ```
 
-**Duration formula**:
+**Actual rate may be lower** if the endpoint is slow (e.g. 500ms sendBatch → only 2 batch/s). The cap is a ceiling, not a floor.
+
+**Duration formula (upper-bound estimate)**:
 ```
-backfill_time ≈ total_log_lines_in_range / 5,000 lines/s
+backfill_time ≳ total_log_lines_in_range / 5,000 lines/s
 ```
 
 where `total_log_lines_in_range` = number of requests the domain actually served during `[A, B]`.
@@ -169,16 +175,18 @@ where `total_log_lines_in_range` = number of requests the domain actually served
 
 ### How to speed up
 
-If delivery is too slow, edit `wrangler-backfill.toml`:
+The ceiling = `max_batch_size × max_concurrency × (1000 / MIN_SENDER_INVOCATION_MS)` msgs/s. With the 200ms floor, each invocation still caps at 5/s, so scaling comes from batch size and/or concurrency:
 
-| Change | New rate | Multiplier |
+| Change (`wrangler-backfill.toml`) | Cap becomes | Multiplier |
 |---|---|---|
-| `max_batch_size=2, max_concurrency=1` | ~10 batch/s | 2× |
-| `max_batch_size=5, max_concurrency=1` | ~25 batch/s | 5× |
-| `max_batch_size=5, max_concurrency=2` | ~50 batch/s | 10× |
-| `max_batch_size=10, max_concurrency=2` | ~100 batch/s | 20× |
+| `max_batch_size=2, max_concurrency=1` | ≤ 10 batch/s | 2× |
+| `max_batch_size=5, max_concurrency=1` | ≤ 25 batch/s | 5× |
+| `max_batch_size=5, max_concurrency=2` | ≤ 50 batch/s | 10× |
+| `max_batch_size=10, max_concurrency=2` | ≤ 100 batch/s | 20× |
 
 Then `wrangler deploy --config wrangler-backfill.toml`.
+
+To change the 200ms floor itself (e.g. lift to 400ms or reduce to 100ms), edit `MIN_SENDER_INVOCATION_MS` in `src/index.js` and redeploy.
 
 **⚠️ Confirm the customer's receiving endpoint can handle the higher load first.** The default slow rate is intentional — to stay gentle on the endpoint while production traffic is also flowing in. Tuning `BACKFILL_RATE` (the Producer rate) alone does NOT speed up delivery; it only grows the `send-queue-backfill` backlog.
 
@@ -207,7 +215,7 @@ A: No. `END_TIME` must be ≤ current time. Attempting future time returns a val
 A: The worker will scan R2 and find zero matching files, resulting in `status=done` with `enqueued_count=0`. Check that files actually exist for your range under `logs/YYYYMMDD/`.
 
 **Q: How do I know when real delivery (not just enqueue) is complete?**
-A: When `send-queue-backfill` is empty. Check via CF Dashboard → Queues. Total time ≈ `(enqueued_count × avg_batches_per_file) ÷ 5 batch/s` — varies significantly with your Logpush file sizes.
+A: When `send-queue-backfill` is empty. Check via CF Dashboard → Queues. Total time ≥ `(enqueued_count × avg_batches_per_file) ÷ 5 batch/s` (lower bound; actual may be longer if endpoint is slow). Varies significantly with your Logpush file sizes.
 
 ## Related
 

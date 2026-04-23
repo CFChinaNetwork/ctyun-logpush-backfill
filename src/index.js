@@ -3,7 +3,8 @@
  *
  * 专用于补传指定时间范围 [BACKFILL_START_TIME, BACKFILL_END_TIME] 的 Logpush 日志。
  * 和生产 worker(ctyun-logpush)完全独立：独立 queues、独立 processed-backfill/ 前缀、
- * 独立 Sender 限速（max_concurrency=1 × max_batch_size=1 ≈ 5 batch/s 稳定匀速）。
+ * 独立 Sender 限速（max_concurrency=1 × max_batch_size=1 + 代码级 200ms/invocation 节流
+ *   → 严格 ≤ 5 batch/s = 5,000 lines/s，不受接收端 RTT 波动影响）
  * 共享同一个 R2 bucket：只读 logs/ 前缀，写入独立的 processed-backfill/ 和 backfill-state/。
  *
  * Architecture:
@@ -11,7 +12,8 @@
  *                           ↓
  *                      Backfill Parser → processed-backfill/ → send-queue-backfill
  *                           ↓
- *                      Backfill Sender (max_concurrency=1, ~5 batch/s 匀速)
+ *                      Backfill Sender (max_concurrency=1, max_batch_size=1,
+ *                                       code-throttled to ≤ 5 invocations/s)
  *                           ↓
  *                      接收端服务器（与生产同一个 endpoint，共用同样的 CTYUN_* secrets）
  *
@@ -127,6 +129,14 @@ const LIST_LIMIT            = 1000;
 const MAX_DAY_PREFIXES      = 5;
 const LOG_LEVELS            = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
 
+// ⭐ Sender 节流：每次 handleSendQueue invocation 至少花费 MIN_SENDER_INVOCATION_MS
+// 配合 max_concurrency=1 (无并行 invocation) + max_batch_size=1 (每 invocation 1 条 msg)
+//   → 严格保证 ≤ 5 invocations/s = 5 msg/s = 5,000 lines/s 的发送上限
+// 若 sendBatch 实际耗时已超过此值（如接收端慢），不 sleep，以实际耗时为准（更慢）
+// 若接收端非常快（<200ms），sleep 补齐到 200ms，确保不会因 endpoint 抖动而突破上限
+// 注：sleep 只占 wall time，不占 CPU time，不增加 Worker 计费
+const MIN_SENDER_INVOCATION_MS = 200;
+
 // ─── 主入口 ────────────────────────────────────────────────────────────────
 export default {
   // Queue consumer: 同时处理两个 backfill 专用队列
@@ -217,8 +227,11 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env) {
 }
 
 // ─── Sender: processed-backfill/ → Gzip → MD5鉴权 → POST → 删除临时文件 ──────
-// 与生产 Sender 逻辑完全一致，只是处理 BATCH_PREFIX 不同的文件
+// 核心逻辑与生产 Sender 一致（处理 BATCH_PREFIX 不同的文件）
+// 额外增加：invocation-level 节流（见 MIN_SENDER_INVOCATION_MS 常量说明）
 async function handleSendQueue(batch, env) {
+  const invocationStart = Date.now();
+
   const results = await Promise.allSettled(
     batch.messages.map(msg => sendBatch(msg, env))
   );
@@ -226,6 +239,15 @@ async function handleSendQueue(batch, env) {
     if (r.status === 'fulfilled') batch.messages[i].ack();
     else { log(env, 'warn', `Send failed, retry: ${r.reason}`); batch.messages[i].retry(); }
   });
+
+  // 节流：确保本次 invocation 至少占用 MIN_SENDER_INVOCATION_MS
+  // 这保证了 "invocation/s" 的代码级上限，配合 max_concurrency=1 严格限制吞吐
+  const elapsed = Date.now() - invocationStart;
+  if (elapsed < MIN_SENDER_INVOCATION_MS) {
+    const sleepMs = MIN_SENDER_INVOCATION_MS - elapsed;
+    log(env, 'debug', `Sender throttle: slept ${sleepMs}ms after ${elapsed}ms of work (cap ${MIN_SENDER_INVOCATION_MS}ms/invocation)`);
+    await new Promise((r) => setTimeout(r, sleepMs));
+  }
 }
 
 async function sendBatch(msg, env) {
@@ -486,7 +508,7 @@ async function runEnqueue(env, state, config, startedAt) {
     state.status       = 'done';
     state.completed_at = new Date().toISOString();
     const durMin = Math.round((Date.parse(state.completed_at) - Date.parse(state.started_at)) / 60000);
-    log(env, 'info', `🎉 Backfill ENQUEUE COMPLETE! enqueued=${state.enqueued_count} files over ${durMin}min of cron activity. Backfill Parser/Sender will continue processing asynchronously at ~5 batch/s. Monitor send-queue-backfill backlog for actual delivery completion.`);
+    log(env, 'info', `🎉 Backfill ENQUEUE COMPLETE! enqueued=${state.enqueued_count} files over ${durMin}min of cron activity. Backfill Parser/Sender will continue processing asynchronously at ≤ 5 batch/s (code-capped). Monitor send-queue-backfill backlog for actual delivery completion.`);
   }
 
   return true;
