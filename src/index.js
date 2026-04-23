@@ -433,7 +433,19 @@ async function runEnqueue(env, state, config, startedAt) {
 
         const range = extractFileTimeRange(key);
         if (!range) continue;
-        if (range.endMs < config.startMs || range.startMs > config.endMs) continue;
+
+        // ⭐ 早停：R2 list 按字典序返回 key，Logpush 文件名格式 YYYYMMDDTHHMMSSZ_...
+        //    字典序 == 时间序，因此一旦扫到 key.startMs > config.endMs，
+        //    后续所有 key 的时间都会超 END。立即标记该 prefix 完成，避免
+        //    scheduled handler 继续扫到 prefix 末尾（可能是几小时 / 几万文件）。
+        //    功能等价但省大量 R2 list 调用 + cron wall time。
+        if (range.startMs > config.endMs) {
+          prog.done = true;
+          log(env, 'debug', `[Enqueue] Early termination at ${key} (startMs > endMs), prefix=${prefix}`);
+          break;  // 跳出 for 循环；外层 while 会因 prog.done=true 在下次 check 退出
+        }
+
+        if (range.endMs < config.startMs) continue;
 
         try {
           // 格式与 R2 Event Notification 一致，handleParseQueue 读 msg.body.object.key
@@ -451,6 +463,7 @@ async function runEnqueue(env, state, config, startedAt) {
       }
 
       if (!pageExhausted) break;  // 当前页被 rate 截断，保留 start_after，下次续
+      if (prog.done) break;       // 早停命中，prefix 已完成
 
       if (list.objects.length < LIST_LIMIT) {
         prog.done = true;
