@@ -173,14 +173,17 @@ footer {
       <div class="card info"><h3>用途</h3><p>精确回放指定时间窗 <code>[A, B]</code> 内的历史日志，不影响生产 CF 内部链路。</p></div>
       <div class="card info"><h3>共享资源</h3><p>Backfill 与生产共享同一个客户接收 endpoint，因此默认发送速率保持保守。</p></div>
       <div class="card info"><h3>默认上限</h3><p>默认发送上限为 <code>&lt;= 5,000 行/秒</code>，实际速率取决于客户 ACK 时间与日志批次大小。</p></div>
+      <div class="card info"><h3>请求过滤</h3><p>仅处理父请求 / top-level requests：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code>。</p></div>
       <div class="card info"><h3>自动清理</h3><p>成功完成后会在一个较长的安全等待期后自动清理 <code>processed-backfill/&lt;run-id&gt;/</code> 和发送统计文件，尽量不在客户 R2 留下尾巴。</p></div>
     </div>
 
     <div class="card">
       <p>数据流转如下：</p>
-      <pre><code>R2 logs/ -> parse-queue-backfill -> Parser -> processed-backfill/&lt;run-id&gt;/
+      <pre><code>R2 logs/ -> parse-queue-backfill -> Parser
+        -> RunAggregator Durable Object
+        -> processed-backfill/&lt;run-id&gt;/
         -> send-queue-backfill -> Sender -> customer endpoint</code></pre>
-      <p>Backfill 只读取 <code>logs/</code> 下的原始 Logpush 文件，不会改动客户原始日志。</p>
+      <p>Backfill 只读取 <code>logs/</code> 下的原始 Logpush 文件，不会改动客户原始日志。Parser 会逐条解压并过滤掉 Workers 子请求，只保留父请求。</p>
     </div>
   </section>
 
@@ -190,8 +193,10 @@ footer {
       <p>部署前，客户只需要确认这几个值：</p>
       <table>
         <tr><th>字段</th><th>含义</th></tr>
+        <tr><td><code>RUN_AGGREGATOR</code></td><td>Durable Object 绑定，用于跨多个 raw 文件聚合日志行并凑满 batch。</td></tr>
         <tr><td><code>BACKFILL_START_TIME</code></td><td>补传开始时间，ISO 8601 格式</td></tr>
         <tr><td><code>BACKFILL_END_TIME</code></td><td>补传结束时间，必须小于等于当前时间</td></tr>
+        <tr><td><code>BACKFILL_ENABLED</code></td><td>默认建议保持 <code>false</code>，确认配置无误后再改成 <code>true</code>。</td></tr>
         <tr><td><code>BACKFILL_RATE</code></td><td>每分钟扫描多少个 raw 文件，当前示例值 <code>20</code></td></tr>
         <tr><td><code>SEND_TIMEOUT_MS</code></td><td>等待客户 ACK 的最长时间，默认 <code>300000</code></td></tr>
         <tr><td><code>BATCH_SIZE</code></td><td>每次 POST 最多带多少条日志，默认 <code>1000</code></td></tr>
@@ -207,6 +212,8 @@ wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
 wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml</code></pre>
       <p>部署：</p>
       <pre><code>wrangler deploy --config wrangler-backfill.toml</code></pre>
+      <p>Durable Object 不需要额外手工创建，Wrangler 会按配置中的 migration 自动完成。</p>
+      <p>如果上一个 run 还没结束，请不要直接改时间窗重跑。必须等 <code>/backfill/status</code> 里的 <code>status = "cleaned"</code> 后，再改 <code>BACKFILL_START_TIME</code> / <code>BACKFILL_END_TIME</code>。</p>
     </div>
   </section>
 

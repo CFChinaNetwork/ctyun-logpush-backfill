@@ -14,8 +14,10 @@ Before deploying, review and adjust `wrangler-backfill.toml`:
 | `account_id` | `0297df3199a9...` | **Must change** to your own Cloudflare Account ID |
 | `bucket_name` | `cdn-logs-raw` | Your R2 bucket name |
 | `R2_BUCKET_NAME` | `cdn-logs-raw` | Must match `bucket_name` |
+| `RUN_AGGREGATOR` | `RunAggregator` | Durable Object binding used for cross-file batching |
 | `BACKFILL_START_TIME` | `""` | Required start time (ISO 8601) |
 | `BACKFILL_END_TIME` | `""` | Required end time (ISO 8601, must be <= now) |
+| `BACKFILL_ENABLED` | `"false"` | Set to `"true"` only when you are ready to run the replay |
 | `BACKFILL_RATE` | `"20"` | Raw files scanned per cron minute |
 | `SEND_TIMEOUT_MS` | `"300000"` | Max wait for customer ACK before retry |
 
@@ -36,20 +38,24 @@ wrangler queues create parse-dlq-backfill
 wrangler queues create send-dlq-backfill
 ```
 
+No extra manual setup is required for the Durable Object. It is created automatically by Wrangler using the migration in `wrangler-backfill.toml`.
+
 ## Deployment
 
-Push to `main` triggers automatic deployment via GitHub Actions.
-
-Or deploy manually:
+Deploy manually:
 
 ```bash
 wrangler deploy --config wrangler-backfill.toml
 ```
 
+Do not change `BACKFILL_START_TIME` / `BACKFILL_END_TIME` while an existing run is still active. Wait until `/backfill/status` reports `status = "cleaned"` first.
+
 ## Architecture
 
 ```text
-R2 logs/ -> parse-queue-backfill -> Parser -> processed-backfill/<run-id>/
+R2 logs/ -> parse-queue-backfill -> Parser
+         -> RunAggregator Durable Object
+         -> processed-backfill/<run-id>/
          -> send-queue-backfill -> Sender -> customer endpoint
 ```
 
@@ -74,6 +80,7 @@ Key status fields:
 ## Safety Defaults
 
 - Precise record-level replay inside `[BACKFILL_START_TIME, BACKFILL_END_TIME]`
+- Only top-level requests are sent (`ParentRayID = "00"` and `WorkerSubrequest != true`)
 - Sender hard-capped at `<= 5,000 lines/s` by default
 - Temporary artifacts under `processed-backfill/<run-id>/` are auto-cleaned after a successful run with a long safety delay
 - Sender evidence (`ack_ms`, `queue_wait_ms`) is exposed for troubleshooting and customer communication

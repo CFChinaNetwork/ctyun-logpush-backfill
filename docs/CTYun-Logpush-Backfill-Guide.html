@@ -173,14 +173,17 @@ footer {
       <div class="card info"><h3>Use case</h3><p>Replay only the historical records inside a precise time window <code>[A, B]</code>.</p></div>
       <div class="card info"><h3>Isolation</h3><p>The backfill Worker uses its own Worker name, Queues, and <code>processed-backfill/&lt;run-id&gt;/</code> prefix.</p></div>
       <div class="card info"><h3>Shared endpoint</h3><p>The customer ingestion endpoint is still shared with production, so the default sender rate stays conservative.</p></div>
+      <div class="card info"><h3>Request filter</h3><p>Only top-level requests are sent: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code>.</p></div>
       <div class="card info"><h3>Auto-cleanup</h3><p>After a successful run, temporary batch artifacts are automatically removed from R2 after a long safety delay.</p></div>
     </div>
 
     <div class="card">
       <p>Pipeline:</p>
-      <pre><code>R2 logs/ -> parse-queue-backfill -> Parser -> processed-backfill/&lt;run-id&gt;/
+      <pre><code>R2 logs/ -> parse-queue-backfill -> Parser
+        -> RunAggregator Durable Object
+        -> processed-backfill/&lt;run-id&gt;/
         -> send-queue-backfill -> Sender -> customer endpoint</code></pre>
-      <p>The Worker reads only from <code>logs/</code>. It does not modify the customer's original raw logs.</p>
+      <p>The Worker reads only from <code>logs/</code>. It does not modify the customer's original raw logs. The parser decompresses line-by-line and keeps only top-level requests.</p>
     </div>
   </section>
 
@@ -190,8 +193,10 @@ footer {
       <p>Before deployment, make sure these values are set correctly:</p>
       <table>
         <tr><th>Field</th><th>Meaning</th></tr>
+        <tr><td><code>RUN_AGGREGATOR</code></td><td>Durable Object binding used to aggregate lines across raw files and fill batches.</td></tr>
         <tr><td><code>BACKFILL_START_TIME</code></td><td>Required replay start time in ISO 8601.</td></tr>
         <tr><td><code>BACKFILL_END_TIME</code></td><td>Required replay end time in ISO 8601 and must be <= now.</td></tr>
+        <tr><td><code>BACKFILL_ENABLED</code></td><td>Recommended to stay <code>false</code> by default. Set to <code>true</code> only when you are ready to run the replay.</td></tr>
         <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files are scanned per cron minute. Current example: <code>20</code>.</td></tr>
         <tr><td><code>SEND_TIMEOUT_MS</code></td><td>How long the sender waits for the customer ACK before retrying.</td></tr>
         <tr><td><code>BATCH_SIZE</code></td><td>How many log lines are packed into one HTTP POST at most.</td></tr>
@@ -207,6 +212,8 @@ wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
 wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml</code></pre>
       <p>Deploy:</p>
       <pre><code>wrangler deploy --config wrangler-backfill.toml</code></pre>
+      <p>No extra manual setup is required for the Durable Object. Wrangler provisions it automatically through the configured migration.</p>
+      <p>Do not change the replay window while a previous run is still active. Wait until <code>/backfill/status</code> shows <code>status = "cleaned"</code> before changing <code>BACKFILL_START_TIME</code> / <code>BACKFILL_END_TIME</code>.</p>
     </div>
   </section>
 

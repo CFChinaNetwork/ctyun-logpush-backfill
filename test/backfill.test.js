@@ -32,6 +32,34 @@ function createFakeBucket() {
   };
 }
 
+function createFakeAggregatorEnv() {
+  const sent = new Set();
+  return {
+    sent,
+    RUN_AGGREGATOR: {
+      idFromName(name) {
+        return name;
+      },
+      get() {
+        return {
+          async fetch(url, init) {
+            const path = new URL(url).pathname;
+            const body = JSON.parse(init.body);
+            if (path === '/is-sent') {
+              return Response.json({ sent: sent.has(body.batchKey) });
+            }
+            if (path === '/mark-sent') {
+              sent.add(body.batchKey);
+              return Response.json({ sent: true });
+            }
+            return Response.json({ ok: true });
+          },
+        };
+      },
+    },
+  };
+}
+
 test('record window clipping keeps only records inside [start, end]', () => {
   const run = { startMs: 1000, endMs: 2000 };
 
@@ -40,6 +68,13 @@ test('record window clipping keeps only records inside [start, end]', () => {
   assert.equal(__test.isRecordInRunWindow(1500, run), true);
   assert.equal(__test.isRecordInRunWindow(2000, run), true);
   assert.equal(__test.isRecordInRunWindow(2001, run), false);
+});
+
+test('isTopLevelParentRequest keeps only parent worker requests', () => {
+  assert.equal(__test.isTopLevelParentRequest({ ParentRayID: '00', WorkerSubrequest: false }), true);
+  assert.equal(__test.isTopLevelParentRequest({ ParentRayID: '00', WorkerSubrequest: 'true' }), false);
+  assert.equal(__test.isTopLevelParentRequest({ ParentRayID: 'abc', WorkerSubrequest: false }), false);
+  assert.equal(__test.isTopLevelParentRequest({ ParentRayID: null, WorkerSubrequest: false }), false);
 });
 
 test('parseConfig builds a canonical window id from the configured window', () => {
@@ -151,12 +186,16 @@ test('updateSendStats aggregates ack and queue wait metrics', () => {
 
 test('cleanup helpers normalize state and mark pending artifacts correctly', () => {
   const cleanup = __test.normalizeCleanupState(null);
+  const aggregate = __test.normalizeAggregateStatus({ pending_batch_ids: ['00000001', '00000002'] }, 'run-1');
 
   assert.equal(cleanup.status, 'pending');
   assert.equal(cleanup.ready_at, null);
+  assert.equal(aggregate.pending_batch_count, 2);
   assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt'), true);
   assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt.queued'), true);
   assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt.done'), false);
+  assert.equal(__test.canReinitializeFromState({ status: 'cleaned' }), true);
+  assert.equal(__test.canReinitializeFromState({ status: 'done' }), false);
 });
 
 test('compactStateAfterCleanup keeps only minimal cleaned marker state', () => {
@@ -174,12 +213,21 @@ test('compactStateAfterCleanup keeps only minimal cleaned marker state', () => {
       ready_at: '2026-04-24T04:45:00.000Z',
       deleted_objects: 27,
     },
+    aggregate: {
+      emitted_batches: 11,
+      pending_batch_ids: ['00000001'],
+      pending_batch_count: 1,
+      finalized: true,
+      finalized_at: '2026-04-24T04:40:00.000Z',
+    },
   });
 
   assert.equal(compacted.status, 'cleaned');
   assert.equal(compacted.cleanup.status, 'done');
   assert.equal(compacted.cleanup.deleted_objects, 27);
   assert.equal(compacted.enqueued_count, 30);
+  assert.equal(compacted.aggregate.emitted_batches, 11);
+  assert.equal(compacted.aggregate.pending_batch_count, 0);
   assert.equal('enqueue_progress' in compacted, false);
 });
 
@@ -198,4 +246,29 @@ test('isR2ListComplete follows truncated instead of object count', () => {
   assert.equal(__test.isR2ListComplete({ objects: new Array(68), truncated: true }), false);
   assert.equal(__test.isR2ListComplete({ objects: new Array(68), truncated: false }), true);
   assert.equal(__test.isR2ListComplete({ objects: new Array(1000) }), true);
+});
+
+test('isPendingCleanupArtifact ignores sent .txt artifacts', async () => {
+  const RAW_BUCKET = createFakeBucket();
+  const env = { RAW_BUCKET, ...createFakeAggregatorEnv() };
+  RAW_BUCKET.objects.set('processed-backfill/run-1/batch-00000001.txt.done', '1');
+
+  assert.equal(await __test.isPendingCleanupArtifact(env, 'run-1', 'processed-backfill/run-1/batch-00000001.txt'), false);
+  assert.equal(await __test.isPendingCleanupArtifact(env, 'run-1', 'processed-backfill/run-1/batch-00000001.txt.queued'), true);
+});
+
+test('deleteR2Keys reports failed deletions', async () => {
+  const RAW_BUCKET = createFakeBucket();
+  RAW_BUCKET.objects.set('a', '1');
+  RAW_BUCKET.objects.set('b', '1');
+  RAW_BUCKET.delete = async (key) => {
+    if (key === 'b') throw new Error('boom');
+    RAW_BUCKET.objects.delete(key);
+  };
+
+  const failed = await __test.deleteR2Keys({ RAW_BUCKET }, ['a', 'b']);
+
+  assert.deepEqual(failed, ['b']);
+  assert.equal(RAW_BUCKET.objects.has('a'), false);
+  assert.equal(RAW_BUCKET.objects.has('b'), true);
 });

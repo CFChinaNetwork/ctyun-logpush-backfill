@@ -10,7 +10,11 @@
  * Architecture:
  *   scheduled(每分钟) → 扫 R2 logs/ → rate-limited 入 parse-queue-backfill
  *                           ↓
- *                      Backfill Parser → processed-backfill/ → send-queue-backfill
+ *                      Backfill Parser（逐条过滤父请求）
+ *                           ↓
+ *                      RunAggregator Durable Object（跨 raw 文件聚合，凑满 batch）
+ *                           ↓
+ *                      processed-backfill/ → send-queue-backfill
  *                           ↓
  *                      Backfill Sender (max_concurrency=1, max_batch_size=1,
  *                                       code-throttled to ≤ 5 invocations/s)
@@ -26,6 +30,8 @@
  *   GET /backfill/status — 返回 R2 里的 backfill-state/progress.json
  */
 'use strict';
+
+const DurableObjectBase = globalThis.DurableObject || class {};
 
 // ─── IATA机场三字码 → 国家两字码（复用自生产 index.js，#45 country 字段）───────
 const IATA_TO_COUNTRY = Object.freeze({
@@ -129,6 +135,7 @@ const MAX_RATE              = 100;
 const DEFAULT_RATE          = 5;
 const LIST_LIMIT            = 1000;
 const MAX_DAY_PREFIXES      = 5;
+const AGGREGATOR_CHUNK_LINES = 1000;
 const DEFAULT_SEND_TIMEOUT_MS = 300_000;
 const MIN_SEND_TIMEOUT_MS     = 1_000;
 const LOG_LEVELS            = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
@@ -161,14 +168,13 @@ export default {
   },
 };
 
-// ─── Parser: R2原始文件 → 流式解析转换 → R2 processed-backfill/ → send-queue-backfill ──
+// ─── Parser: R2原始文件 → 流式解析转换 → RunAggregator Durable Object ───────────
 // 相比生产 Parser：
 //   - 逐条按 [BACKFILL_START_TIME, BACKFILL_END_TIME] 裁切，避免边界文件整段重放
-//   - 写入 processed-backfill/<run-id>/（不同 backfill run 互不污染）
+//   - 逐条过滤 Workers 子请求，只保留父请求
+//   - 不再按单个 raw file 直接成批；改为喂给 DO 做跨文件聚合
 async function handleParseQueue(batch, env) {
-  for (const msg of batch.messages) {
-    await processFile(msg, env);
-  }
+  await Promise.allSettled(batch.messages.map((msg) => processFile(msg, env)));
 }
 
 async function processFile(msg, env) {
@@ -195,8 +201,9 @@ async function processFile(msg, env) {
   try {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
-    const batchSize = parseInt(env.BATCH_SIZE || '1000', 10);
-    let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, skipped = 0, invalidTs = 0;
+    const aggregatorChunkLines = parseAggregatorChunkLines(env);
+    const aggregator = getRunAggregatorStub(env, run.id);
+    let lines = [], chunkIdx = 0, lineCount = 0, errCount = 0, skipped = 0, invalidTs = 0, skippedWorker = 0, kept = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
       lineCount++;
       const recordMs = parseTimestamp(record.EdgeStartTimestamp);
@@ -209,20 +216,27 @@ async function processFile(msg, env) {
         skipped++;
         return;
       }
+      if (!isTopLevelParentRequest(record)) {
+        skipped++;
+        skippedWorker++;
+        return;
+      }
       try {
         lines.push(transformEdge(record));
+        kept++;
       } catch (e) {
         errCount++;
         log(env, 'warn', `Transform err line ${lineCount}: ${e.message}`);
         return;
       }
-      if (lines.length >= batchSize) {
-        await writeBatchAndEnqueue(lines, key, batchIdx++, env, run);
+      if (lines.length >= aggregatorChunkLines) {
+        await sendChunkToAggregator(aggregator, key, chunkIdx++, lines, run);
         lines = [];
       }
     });
-    if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env, run);
-    log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} skipped=${skipped} invalid_ts=${invalidTs} run=${run.id}`);
+    if (lines.length > 0) await sendChunkToAggregator(aggregator, key, chunkIdx++, lines, run);
+    await markSourceFileComplete(aggregator, key, run);
+    log(env, 'info', `Done: ${key} | lines=${lineCount} kept=${kept} chunks=${chunkIdx} errors=${errCount} skipped=${skipped} invalid_ts=${invalidTs} skipped_worker=${skippedWorker} run=${run.id}`);
     msg.ack();
   } catch (err) {
     log(env, 'error', `Failed: ${key}: ${err.message}`);
@@ -305,9 +319,13 @@ async function sendBatch(msg, env) {
     log(env, 'info', `Already sent (skip duplicate): ${key}`);
     return;
   }
+  if (runId && await isBatchMarkedSent(env, runId, key)) {
+    log(env, 'info', `Already sent via durable marker (skip duplicate): ${key}`);
+    return;
+  }
   const object = await env.RAW_BUCKET.get(key);
   if (!object) {
-    if (runId && await isRunCleaned(env, runId)) {
+    if (runId && (await isRunCleaned(env, runId) || await isBatchMarkedSent(env, runId, key))) {
       log(env, 'info', `Batch already cleaned after completion (skip late duplicate): ${key}`);
       return;
     }
@@ -385,28 +403,39 @@ async function sendBatch(msg, env) {
     bytes: object.size ?? null,
   });
   log(env, 'info', `Sent ${object.size ?? '?'} bytes (uncompressed) → HTTP ${resp.status} | ack_ms=${ackMs}${queueWaitMs === null ? '' : ` queue_wait_ms=${queueWaitMs}`} | ${key}`);
-  let wroteDone = false;
-  await env.RAW_BUCKET.put(`${key}.done`, '1', {
-    httpMetadata: { contentType: 'text/plain' },
-  }).then(() => {
-    wroteDone = true;
-  }).catch((e) => {
-    log(env, 'warn', `Done marker write failed (keeping batch file for investigation): ${key}: ${e.message}`);
-  });
-  if (wroteDone) {
-    await Promise.allSettled([
-      env.RAW_BUCKET.delete(key),
-      env.RAW_BUCKET.delete(queuedMarkerKey),
-    ]).then((results) => {
-      if (results[0].status === 'rejected') {
-        log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${results[0].reason?.message || results[0].reason}`);
-      }
-      if (results[1].status === 'rejected') {
-        log(env, 'warn', `Queued marker cleanup failed: ${queuedMarkerKey}: ${results[1].reason?.message || results[1].reason}`);
-      }
-    });
-    log(env, 'debug', `Deleted: ${key}`);
+  let durableSent = false;
+  if (runId) {
+    try {
+      await markBatchAsSent(env, runId, key);
+      durableSent = true;
+    } catch (e) {
+      log(env, 'warn', `Durable sent marker write failed: ${key}: ${e.message}`);
+    }
   }
+  let wroteDone = false;
+  try {
+    await env.RAW_BUCKET.put(`${key}.done`, '1', {
+      httpMetadata: { contentType: 'text/plain' },
+    });
+    wroteDone = true;
+  } catch (e) {
+    log(env, 'warn', `Done marker write failed (keeping batch file for investigation): ${key}: ${e.message}`);
+  }
+  if (!durableSent && !wroteDone) {
+    throw new Error(`Successful POST but failed to persist any sent marker for ${key}`);
+  }
+  await Promise.allSettled([
+    env.RAW_BUCKET.delete(key),
+    env.RAW_BUCKET.delete(queuedMarkerKey),
+  ]).then((results) => {
+    if (results[0].status === 'rejected') {
+      log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${results[0].reason?.message || results[0].reason}`);
+    }
+    if (results[1].status === 'rejected') {
+      log(env, 'warn', `Queued marker cleanup failed: ${queuedMarkerKey}: ${results[1].reason?.message || results[1].reason}`);
+    }
+  });
+  log(env, 'debug', `Deleted: ${key}`);
 }
 
 // ─── Scheduled handler: 扫 R2 logs/ → rate-limited 入 parse-queue-backfill ──
@@ -436,6 +465,7 @@ async function runBackfillScan(env) {
       changed = (await runEnqueue(env, state, config, startedAt)) || changed;
     }
     if (state.status === 'done' && Date.now() - startedAt < WALL_TIME_BUDGET_MS) {
+      changed = (await syncAggregatorStatus(env, state)) || changed;
       changed = (await maybeAutoCleanup(env, state, startedAt)) || changed;
     }
 
@@ -508,16 +538,22 @@ async function loadState(env, config) {
           state.run_id = buildRunInstanceId(config.startMs, config.endMs);
         }
         state.cleanup = normalizeCleanupState(state.cleanup);
+        state.aggregate = normalizeAggregateStatus(state.aggregate, state.run_id);
         return state;
+      }
+      if (!canReinitializeFromState(state)) {
+        throw new Error(`Existing backfill run ${state.run_id} is still ${state.status}. Wait until status="cleaned" before changing BACKFILL_START_TIME/BACKFILL_END_TIME.`);
       }
       log(env, 'info', `Config changed (was ${state.config?.start}→${state.config?.end}, now ${config.start}→${config.end}). Re-initializing state.`);
     } catch (e) {
+      if (String(e.message || '').includes('Existing backfill run')) throw e;
       log(env, 'warn', `State file corrupted, re-initializing: ${e.message}`);
     }
   }
+  const runId = buildRunInstanceId(config.startMs, config.endMs);
   return {
     config:           { start: config.start, end: config.end, rate: config.rate },
-    run_id:           buildRunInstanceId(config.startMs, config.endMs),
+    run_id:           runId,
     phase:            'enqueue',
     status:           'running',
     started_at:       new Date().toISOString(),
@@ -526,6 +562,7 @@ async function loadState(env, config) {
     last_cron_at:     null,
     completed_at:     null,
     cleanup:          createInitialCleanupState(),
+    aggregate:        createInitialAggregateStatus(runId),
   };
 }
 
@@ -651,6 +688,9 @@ async function runEnqueue(env, state, config, startedAt) {
 
 async function maybeAutoCleanup(env, state, startedAt) {
   state.cleanup = normalizeCleanupState(state.cleanup);
+  if (state.aggregate?.finalized !== true || (state.aggregate?.pending_batch_count ?? 0) > 0) {
+    return false;
+  }
 
   if (state.cleanup.status === 'done') {
     if (state.status !== 'cleaned') {
@@ -697,7 +737,8 @@ async function inspectRunArtifacts(env, state, startedAt) {
     }
 
     for (const obj of page.objects) {
-      if (isPendingRunArtifact(obj.key)) {
+      const pending = await isPendingCleanupArtifact(env, state.run_id, obj.key);
+      if (pending) {
         const hadCleanupState = state.cleanup.status !== 'pending' || state.cleanup.ready_at !== null || state.cleanup.inspect_start_after !== null;
         state.cleanup = createInitialCleanupState();
         if (hadCleanupState) {
@@ -710,7 +751,7 @@ async function inspectRunArtifacts(env, state, startedAt) {
     state.cleanup.inspect_start_after = page.objects[page.objects.length - 1].key;
     changed = true;
 
-    if (page.objects.length < LIST_LIMIT) {
+    if (isR2ListComplete(page)) {
       state.cleanup.status = 'ready';
       state.cleanup.ready_at = state.cleanup.ready_at || new Date().toISOString();
       state.cleanup.inspect_start_after = null;
@@ -721,6 +762,14 @@ async function inspectRunArtifacts(env, state, startedAt) {
     startAfter = state.cleanup.inspect_start_after || undefined;
   }
 
+  return changed;
+}
+
+async function syncAggregatorStatus(env, state) {
+  const aggregator = await finalizeAggregatorIfReady(env, state.run_id, state.enqueued_count);
+  const normalized = normalizeAggregateStatus(aggregator, state.run_id);
+  const changed = JSON.stringify(state.aggregate ?? null) !== JSON.stringify(normalized);
+  state.aggregate = normalized;
   return changed;
 }
 
@@ -740,12 +789,16 @@ async function deleteRunArtifacts(env, state, startedAt) {
     }
 
     const keys = page.objects.map((obj) => obj.key);
-    await deleteR2Keys(env, keys);
+    const failedKeys = await deleteR2Keys(env, keys);
+    if (failedKeys.length > 0) {
+      log(env, 'warn', `Auto-cleanup delete retry needed for ${failedKeys.length} objects in run ${state.run_id}.`);
+      return changed;
+    }
     state.cleanup.deleted_objects += keys.length;
     state.cleanup.delete_start_after = page.objects[page.objects.length - 1].key;
     changed = true;
 
-    if (page.objects.length < LIST_LIMIT) {
+    if (isR2ListComplete(page)) {
       await env.RAW_BUCKET.delete(SEND_STATS_KEY).catch(() => {});
       Object.assign(state, compactStateAfterCleanup(state));
       log(env, 'info', `Auto-cleanup complete for run ${state.run_id}. Removed temporary backfill artifacts under ${prefix}.`);
@@ -760,12 +813,17 @@ async function deleteRunArtifacts(env, state, startedAt) {
 
 async function deleteR2Keys(env, keys) {
   if (keys.length === 0) return;
-
-  try {
-    await env.RAW_BUCKET.delete(keys);
-  } catch {
-    await Promise.allSettled(keys.map((key) => env.RAW_BUCKET.delete(key)));
+  const failed = [];
+  for (const key of keys) {
+    try {
+      await env.RAW_BUCKET.delete(key);
+      const exists = await env.RAW_BUCKET.head(key).catch(() => null);
+      if (exists) failed.push(key);
+    } catch {
+      failed.push(key);
+    }
   }
+  return failed;
 }
 
 // ─── HTTP fetch handler ─────────────────────────────────────────────────────
@@ -1102,6 +1160,142 @@ function parsePositiveInt(raw, fallback, min) {
   return parsed;
 }
 
+function parseAggregatorChunkLines(env) {
+  return parsePositiveInt(env.BATCH_SIZE, AGGREGATOR_CHUNK_LINES, 1);
+}
+
+function isTopLevelParentRequest(record) {
+  return String(record?.ParentRayID ?? '') === '00' && record?.WorkerSubrequest !== true && record?.WorkerSubrequest !== 'true';
+}
+
+function buildAggregateChunkId(sourceKey, index) {
+  return `${sourceKey.replace(/[^a-zA-Z0-9_-]/g, '_')}-${index}`;
+}
+
+function buildFinalBatchKey(runId, index) {
+  return `${getBatchPrefix(runId)}batch-${String(index).padStart(8, '0')}.txt`;
+}
+
+function buildPendingBatchId(index) {
+  return String(index).padStart(8, '0');
+}
+
+function createInitialAggregateStatus(runId) {
+  return {
+    run_id: runId,
+    processed_chunks: 0,
+    completed_files: 0,
+    expected_files: null,
+    emitted_batches: 0,
+    next_batch_seq: 0,
+    pending_batch_ids: [],
+    pending_batch_count: 0,
+    pending_buffer_lines: 0,
+    finalized: false,
+    finalized_at: null,
+    last_chunk_id: null,
+    last_source_key: null,
+    last_batch_key: null,
+    updated_at: null,
+  };
+}
+
+function normalizeAggregateStatus(status, runId) {
+  const normalized = {
+    ...createInitialAggregateStatus(runId),
+    ...(status && typeof status === 'object' ? status : {}),
+    run_id: runId,
+  };
+  normalized.pending_batch_ids = Array.isArray(normalized.pending_batch_ids) ? normalized.pending_batch_ids : [];
+  normalized.pending_batch_count = normalized.pending_batch_ids.length;
+  return normalized;
+}
+
+function getRunAggregatorStub(env, runId) {
+  const id = env.RUN_AGGREGATOR.idFromName(runId);
+  return env.RUN_AGGREGATOR.get(id);
+}
+
+async function sendChunkToAggregator(stub, sourceKey, chunkIndex, lines, run) {
+  return callAggregator(stub, '/ingest', {
+    runId: run.id,
+    sourceKey,
+    chunkId: buildAggregateChunkId(sourceKey, chunkIndex),
+    lines,
+  });
+}
+
+async function markSourceFileComplete(stub, sourceKey, run) {
+  return callAggregator(stub, '/complete-file', {
+    runId: run.id,
+    sourceKey,
+  });
+}
+
+async function finalizeAggregatorIfReady(env, runId, expectedFiles) {
+  return callAggregator(getRunAggregatorStub(env, runId), '/finalize', {
+    runId,
+    expectedFiles,
+  });
+}
+
+async function markBatchAsSent(env, runId, batchKey) {
+  return callAggregator(getRunAggregatorStub(env, runId), '/mark-sent', {
+    runId,
+    batchKey,
+  });
+}
+
+async function isBatchMarkedSent(env, runId, batchKey) {
+  if (!runId) return false;
+  const result = await callAggregator(getRunAggregatorStub(env, runId), '/is-sent', {
+    runId,
+    batchKey,
+  });
+  return result?.sent === true;
+}
+
+async function callAggregator(stub, path, payload) {
+  const response = await stub.fetch(`https://run-aggregator${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Aggregator ${path} failed: HTTP ${response.status} ${text.substring(0, 200)}`);
+  }
+
+  return response.json();
+}
+
+async function writeFinalBatchAndEnqueue(batchKey, lines, env, runId) {
+  const doneMarker = await env.RAW_BUCKET.head(`${batchKey}.done`).catch(() => null);
+  if (doneMarker) return { duplicate: true };
+  if (runId && await isBatchMarkedSent(env, runId, batchKey)) return { duplicate: true };
+
+  const body = lines.join('\n') + '\n';
+  await env.RAW_BUCKET.put(batchKey, body, {
+    httpMetadata: { contentType: 'text/plain; charset=utf-8' },
+  });
+  try {
+    await env.SEND_QUEUE.send({ key: batchKey, queuedAtMs: Date.now(), runId });
+  } catch (error) {
+    await env.RAW_BUCKET.delete(batchKey).catch(() => {});
+    throw error;
+  }
+  return { duplicate: false };
+}
+
+async function loadPendingBatch(storage, pendingId) {
+  return storage.get(`pending-batch:${pendingId}`);
+}
+
+async function deletePendingBatch(storage, pendingId) {
+  await storage.delete(`pending-batch:${pendingId}`);
+}
+
 function isR2ListComplete(listResult) {
   return listResult?.truncated !== true;
 }
@@ -1128,6 +1322,20 @@ function isPendingRunArtifact(key) {
   return key.endsWith('.txt') || key.endsWith('.queued');
 }
 
+function canReinitializeFromState(state) {
+  return state?.status === 'cleaned';
+}
+
+async function isPendingCleanupArtifact(env, runId, key) {
+  if (key.endsWith('.queued')) return true;
+  if (!key.endsWith('.txt')) return false;
+
+  const doneMarker = await env.RAW_BUCKET.head(`${key}.done`).catch(() => null);
+  if (doneMarker) return false;
+  if (runId && await isBatchMarkedSent(env, runId, key)) return false;
+  return true;
+}
+
 function compactStateAfterCleanup(state) {
   const cleanedAt = new Date().toISOString();
   return {
@@ -1139,6 +1347,15 @@ function compactStateAfterCleanup(state) {
     completed_at: state.completed_at,
     enqueued_count: state.enqueued_count,
     last_cron_at: state.last_cron_at,
+    aggregate: {
+      ...(state.aggregate || createInitialAggregateStatus(state.run_id)),
+      pending_batch_ids: [],
+      pending_batch_count: 0,
+      pending_buffer_lines: 0,
+      finalized: true,
+      finalized_at: state.aggregate?.finalized_at || cleanedAt,
+      updated_at: cleanedAt,
+    },
     cleanup: {
       status: 'done',
       ready_at: state.cleanup.ready_at,
@@ -1299,26 +1516,331 @@ function updateSendStats(stats, outcome) {
   return next;
 }
 
+export class RunAggregator extends DurableObjectBase {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method === 'GET' && url.pathname === '/status') {
+      return jsonResponse(await this.getPublicState());
+    }
+
+    const body = await request.json().catch(() => ({}));
+    switch (url.pathname) {
+      case '/ingest':
+        return jsonResponse(await this.ingest(body));
+      case '/complete-file':
+        return jsonResponse(await this.completeFile(body));
+      case '/finalize':
+        return jsonResponse(await this.finalize(body));
+      case '/mark-sent':
+        return jsonResponse(await this.markSent(body));
+      case '/is-sent':
+        return jsonResponse(await this.isSent(body));
+      default:
+        return new Response('Not Found', { status: 404 });
+    }
+  }
+
+  async ingest(body) {
+    const runId = String(body?.runId || '').trim();
+    const chunkId = String(body?.chunkId || '').trim();
+    const sourceKey = String(body?.sourceKey || '').trim();
+    const lines = Array.isArray(body?.lines) ? body.lines.filter((line) => typeof line === 'string' && line.length > 0) : [];
+
+    if (!runId || !chunkId || !sourceKey) {
+      throw new Error('Aggregator ingest requires runId, chunkId and sourceKey.');
+    }
+
+    const chunkMarkerKey = `chunk:${chunkId}`;
+    let state;
+    let alreadyProcessed = false;
+
+    await this.withStorageTxn(async (txn) => {
+      state = normalizeAggregateStatus(await txn.get('state'), runId);
+      if (await txn.get(chunkMarkerKey)) {
+        alreadyProcessed = true;
+        return;
+      }
+
+      let buffer = await this.loadBufferFrom(txn);
+      buffer.push(...lines);
+
+      while (buffer.length >= this.getBatchSize()) {
+        const batchLines = buffer.splice(0, this.getBatchSize());
+        const seq = state.next_batch_seq++;
+        const pendingId = buildPendingBatchId(seq);
+        const batchKey = buildFinalBatchKey(runId, seq);
+        await txn.put(`pending-batch:${pendingId}`, { id: pendingId, batchKey, lines: batchLines });
+        state.pending_batch_ids.push(pendingId);
+      }
+
+      state.processed_chunks += 1;
+      state.pending_batch_count = state.pending_batch_ids.length;
+      state.pending_buffer_lines = buffer.length;
+      state.last_chunk_id = chunkId;
+      state.last_source_key = sourceKey;
+      state.updated_at = new Date().toISOString();
+
+      await this.saveBufferTo(txn, buffer);
+      await txn.put(chunkMarkerKey, '1');
+      await txn.put('state', state);
+    });
+
+    if (alreadyProcessed) {
+      state = await this.flushPendingBatches(state);
+      return this.toPublicState(state);
+    }
+
+    state = await this.flushPendingBatches(state);
+    return this.toPublicState(state);
+  }
+
+  async completeFile(body) {
+    const runId = String(body?.runId || '').trim();
+    const sourceKey = String(body?.sourceKey || '').trim();
+    if (!runId || !sourceKey) {
+      throw new Error('Aggregator complete-file requires runId and sourceKey.');
+    }
+
+    const fileMarkerKey = `file:${sourceKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    let state;
+    await this.withStorageTxn(async (txn) => {
+      state = normalizeAggregateStatus(await txn.get('state'), runId);
+      if (await txn.get(fileMarkerKey)) {
+        return;
+      }
+      await txn.put(fileMarkerKey, '1');
+      state.completed_files += 1;
+      state.last_source_key = sourceKey;
+      state.updated_at = new Date().toISOString();
+      await txn.put('state', state);
+    });
+    state = await this.flushPendingBatches(state);
+    return this.toPublicState(state);
+  }
+
+  async finalize(body) {
+    const runId = String(body?.runId || '').trim();
+    const expectedFiles = Number(body?.expectedFiles);
+    if (!runId) {
+      throw new Error('Aggregator finalize requires runId.');
+    }
+
+    let state;
+    await this.withStorageTxn(async (txn) => {
+      state = normalizeAggregateStatus(await txn.get('state'), runId);
+      if (Number.isFinite(expectedFiles) && expectedFiles >= 0) {
+        state.expected_files = Math.max(state.expected_files ?? 0, expectedFiles);
+      }
+
+      if (!state.finalized && state.expected_files !== null && state.completed_files >= state.expected_files) {
+        let buffer = await this.loadBufferFrom(txn);
+        if (buffer.length > 0) {
+          const seq = state.next_batch_seq++;
+          const pendingId = buildPendingBatchId(seq);
+          const batchKey = buildFinalBatchKey(runId, seq);
+          await txn.put(`pending-batch:${pendingId}`, { id: pendingId, batchKey, lines: buffer });
+          state.pending_batch_ids.push(pendingId);
+          buffer = [];
+        }
+        await this.saveBufferTo(txn, buffer);
+        state.pending_batch_count = state.pending_batch_ids.length;
+        state.pending_buffer_lines = 0;
+        state.finalized = true;
+        state.finalized_at = new Date().toISOString();
+        state.updated_at = state.finalized_at;
+      }
+
+      await txn.put('state', state);
+    });
+
+    state = await this.flushPendingBatches(state);
+    return this.toPublicState(state);
+  }
+
+  async markSent(body) {
+    const runId = String(body?.runId || '').trim();
+    const batchKey = String(body?.batchKey || '').trim();
+    if (!runId || !batchKey) {
+      throw new Error('Aggregator mark-sent requires runId and batchKey.');
+    }
+
+    await this.ctx.storage.put(`sent:${batchKey}`, '1');
+    return { run_id: runId, batchKey, sent: true };
+  }
+
+  async isSent(body) {
+    const runId = String(body?.runId || '').trim();
+    const batchKey = String(body?.batchKey || '').trim();
+    if (!runId || !batchKey) {
+      throw new Error('Aggregator is-sent requires runId and batchKey.');
+    }
+
+    return {
+      run_id: runId,
+      batchKey,
+      sent: Boolean(await this.ctx.storage.get(`sent:${batchKey}`)),
+    };
+  }
+
+  async loadState(runId) {
+    const state = await this.ctx.storage.get('state');
+    return normalizeAggregateStatus(state, runId);
+  }
+
+  async saveState(state) {
+    await this.ctx.storage.put('state', state);
+  }
+
+  async withStorageTxn(fn) {
+    if (typeof this.ctx.storage.transaction === 'function') {
+      return this.ctx.storage.transaction(fn);
+    }
+    return fn(this.ctx.storage);
+  }
+
+  async loadBuffer() {
+    const buffer = await this.ctx.storage.get('buffer');
+    return Array.isArray(buffer) ? buffer : [];
+  }
+
+  async loadBufferFrom(storage) {
+    const buffer = await storage.get('buffer');
+    return Array.isArray(buffer) ? buffer : [];
+  }
+
+  async saveBuffer(buffer) {
+    if (buffer.length === 0) {
+      await this.ctx.storage.delete('buffer');
+      return;
+    }
+    await this.ctx.storage.put('buffer', buffer);
+  }
+
+  async saveBufferTo(storage, buffer) {
+    if (buffer.length === 0) {
+      if (typeof storage.delete === 'function') {
+        await storage.delete('buffer');
+      }
+      return;
+    }
+    await storage.put('buffer', buffer);
+  }
+
+  getBatchSize() {
+    return parsePositiveInt(this.env.BATCH_SIZE, AGGREGATOR_CHUNK_LINES, 1);
+  }
+
+  async flushPendingBatches(state) {
+    const currentIds = Array.isArray(state.pending_batch_ids) ? [...state.pending_batch_ids] : [];
+    if (currentIds.length === 0) {
+      state.pending_batch_count = 0;
+      return state;
+    }
+
+    const remainingIds = [];
+    let changed = false;
+
+    for (let i = 0; i < currentIds.length; i++) {
+      const pendingId = currentIds[i];
+      const pending = await loadPendingBatch(this.ctx.storage, pendingId);
+      if (!pending) {
+        changed = true;
+        continue;
+      }
+
+      try {
+        await writeFinalBatchAndEnqueue(pending.batchKey, pending.lines, this.env, state.run_id);
+        await deletePendingBatch(this.ctx.storage, pendingId);
+        state.emitted_batches += 1;
+        state.last_batch_key = pending.batchKey;
+        changed = true;
+      } catch (error) {
+        log(this.env, 'warn', `Aggregator pending batch flush failed for ${pending.batchKey}: ${error.message}`);
+        remainingIds.push(pendingId, ...currentIds.slice(i + 1));
+        break;
+      }
+    }
+
+    if (remainingIds.length === 0 && currentIds.length > 0 && !changed) {
+      state.pending_batch_ids = currentIds;
+      state.pending_batch_count = currentIds.length;
+      return state;
+    }
+
+    if (remainingIds.length === 0 && changed && currentIds.length === state.pending_batch_ids.length) {
+      state.pending_batch_ids = [];
+    } else if (remainingIds.length > 0 || changed) {
+      state.pending_batch_ids = remainingIds;
+    }
+
+    state.pending_batch_count = state.pending_batch_ids.length;
+    if (changed || remainingIds.length !== currentIds.length) {
+      state.updated_at = new Date().toISOString();
+      await this.saveState(state);
+    }
+    return state;
+  }
+
+  async getPublicState(runId) {
+    return this.toPublicState(await this.loadState(runId));
+  }
+
+  toPublicState(state) {
+    return {
+      run_id: state.run_id,
+      processed_chunks: state.processed_chunks,
+      completed_files: state.completed_files,
+      expected_files: state.expected_files,
+      emitted_batches: state.emitted_batches,
+      next_batch_seq: state.next_batch_seq,
+      pending_batch_count: state.pending_batch_count,
+      sent_batch_count: state.emitted_batches,
+      pending_buffer_lines: state.pending_buffer_lines,
+      finalized: state.finalized,
+      finalized_at: state.finalized_at,
+      last_chunk_id: state.last_chunk_id,
+      last_source_key: state.last_source_key,
+      last_batch_key: state.last_batch_key,
+      updated_at: state.updated_at,
+    };
+  }
+}
+
 export const __test = {
   createSendStats,
   createInitialCleanupState,
+  createInitialAggregateStatus,
   buildBatchKey,
   buildRunId,
   buildRunInstanceId,
+  buildAggregateChunkId,
+  buildFinalBatchKey,
+  isTopLevelParentRequest,
+  canReinitializeFromState,
   compactStateAfterCleanup,
   extractRunIdFromBatchKey,
   extractFileTimeRange,
   getBatchPrefix,
+  normalizeAggregateStatus,
   isRecordInRunWindow,
   isR2ListComplete,
   isRunCleaned,
+  isPendingCleanupArtifact,
   isPendingRunArtifact,
   normalizeCleanupState,
+  parseAggregatorChunkLines,
   parseQueueWaitMs,
   normalizeRunContext,
   parseConfig,
   parseSendTimeoutMs,
   resolveRunContext,
+  deleteR2Keys,
   loadExistingStateRunId,
   updateSendStats,
   writeBatchAndEnqueue,
