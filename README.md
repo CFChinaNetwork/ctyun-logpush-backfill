@@ -16,7 +16,7 @@ Before deploying, review and adjust `wrangler-backfill.toml`:
 | `R2_BUCKET_NAME` | `cdn-logs-raw` | Must match `bucket_name` |
 | `BACKFILL_START_TIME` | `""` | Required start time (ISO 8601) |
 | `BACKFILL_END_TIME` | `""` | Required end time (ISO 8601, must be <= now) |
-| `BACKFILL_RATE` | `"5"` | Raw files scanned per cron minute |
+| `BACKFILL_RATE` | `"20"` | Raw files scanned per cron minute |
 | `SEND_TIMEOUT_MS` | `"300000"` | Max wait for customer ACK before retry |
 
 Then set the three Worker secrets:

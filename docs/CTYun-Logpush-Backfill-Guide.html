@@ -192,7 +192,7 @@ footer {
         <tr><th>Field</th><th>Meaning</th></tr>
         <tr><td><code>BACKFILL_START_TIME</code></td><td>Required replay start time in ISO 8601.</td></tr>
         <tr><td><code>BACKFILL_END_TIME</code></td><td>Required replay end time in ISO 8601 and must be <= now.</td></tr>
-        <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files are scanned per cron minute.</td></tr>
+        <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files are scanned per cron minute. Current example: <code>20</code>.</td></tr>
         <tr><td><code>SEND_TIMEOUT_MS</code></td><td>How long the sender waits for the customer ACK before retrying.</td></tr>
         <tr><td><code>BATCH_SIZE</code></td><td>How many log lines are packed into one HTTP POST at most.</td></tr>
       </table>

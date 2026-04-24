@@ -90,7 +90,7 @@ BACKFILL_END_TIME   = "2026-04-24T11:30:00+08:00"
 # Consumer 端的 max_concurrency=1 + max_batch_size=1 + MIN_SENDER_INVOCATION_MS=200 是真正决定接收端冲击速率的参数
 # 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（CF Queue 100K 容量内安全）
 # 补传总时长 ≥ 总 batches ÷ 5 batch/s（上限估算，实际若接收端慢会更长）
-BACKFILL_RATE = "5"
+BACKFILL_RATE = "20"
 
 # ==== 可选开关 ====
 BACKFILL_ENABLED = "true"        # 设为 "false" 可暂停（redeploy 生效，state 保留）
