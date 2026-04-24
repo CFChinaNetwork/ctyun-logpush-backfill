@@ -124,6 +124,7 @@ const STATE_KEY             = 'backfill-state/progress.json';
 const SEND_STATS_KEY        = 'backfill-state/send-stats.json';
 const MAX_RANGE_HOURS       = 48;
 const WALL_TIME_BUDGET_MS   = 55_000;       // 留 5s 缓冲给 saveState
+const CLEANUP_GRACE_MS      = 5 * 60_000;
 const MAX_RATE              = 100;
 const DEFAULT_RATE          = 5;
 const LIST_LIMIT            = 1000;
@@ -182,6 +183,11 @@ async function processFile(msg, env) {
   if (!run.valid) {
     log(env, 'error', `Invalid backfill run for ${key}: ${run.error}`);
     msg.retry();
+    return;
+  }
+  if (await isRunCleaned(env, run.id)) {
+    log(env, 'info', `Run already cleaned (skip late parse duplicate): ${key}`);
+    msg.ack();
     return;
   }
 
@@ -301,6 +307,10 @@ async function sendBatch(msg, env) {
   }
   const object = await env.RAW_BUCKET.get(key);
   if (!object) {
+    if (runId && await isRunCleaned(env, runId)) {
+      log(env, 'info', `Batch already cleaned after completion (skip late duplicate): ${key}`);
+      return;
+    }
     throw new Error(`Batch missing before successful send: ${key} (no .done marker present)`);
   }
   const uri        = env.CTYUN_URI_EDGE;
@@ -416,14 +426,17 @@ async function runBackfillScan(env) {
 
     const state = await loadState(env, config);
 
-    if (state.status === 'done') {
-      log(env, 'info', `Backfill done. enqueued=${state.enqueued_count}, completed_at=${state.completed_at}. To re-run: change BACKFILL_START_TIME/END_TIME and redeploy, OR delete R2 object '${STATE_KEY}'.`);
+    if (state.status === 'cleaned') {
+      log(env, 'info', `Backfill cleaned. run_id=${state.run_id}, completed_at=${state.completed_at}, cleaned_at=${state.cleanup?.cleaned_at}. Change BACKFILL_START_TIME/END_TIME and redeploy to run a new window.`);
       return;
     }
 
     let changed = false;
     if (state.phase === 'enqueue' && Date.now() - startedAt < WALL_TIME_BUDGET_MS) {
       changed = (await runEnqueue(env, state, config, startedAt)) || changed;
+    }
+    if (state.status === 'done' && Date.now() - startedAt < WALL_TIME_BUDGET_MS) {
+      changed = (await maybeAutoCleanup(env, state, startedAt)) || changed;
     }
 
     if (changed) {
@@ -494,6 +507,7 @@ async function loadState(env, config) {
         if (!state.run_id) {
           state.run_id = buildRunInstanceId(config.startMs, config.endMs);
         }
+        state.cleanup = normalizeCleanupState(state.cleanup);
         return state;
       }
       log(env, 'info', `Config changed (was ${state.config?.start}→${state.config?.end}, now ${config.start}→${config.end}). Re-initializing state.`);
@@ -510,7 +524,8 @@ async function loadState(env, config) {
     enqueue_progress: {},      // { [prefix]: { start_after, done, enqueued } }
     enqueued_count:   0,
     last_cron_at:     null,
-    completed_at:     null
+    completed_at:     null,
+    cleanup:          createInitialCleanupState(),
   };
 }
 
@@ -630,6 +645,125 @@ async function runEnqueue(env, state, config, startedAt) {
   }
 
   return true;
+}
+
+async function maybeAutoCleanup(env, state, startedAt) {
+  state.cleanup = normalizeCleanupState(state.cleanup);
+
+  if (state.cleanup.status === 'done') {
+    if (state.status !== 'cleaned') {
+      state.status = 'cleaned';
+      return true;
+    }
+    return false;
+  }
+
+  if (state.cleanup.status === 'ready') {
+    const readyAt = Date.parse(state.cleanup.ready_at || '');
+    if (Number.isFinite(readyAt) && Date.now() - readyAt < CLEANUP_GRACE_MS) {
+      return false;
+    }
+    state.cleanup.status = 'deleting';
+    state.cleanup.delete_start_after = null;
+    return true;
+  }
+
+  if (state.cleanup.status === 'deleting') {
+    return deleteRunArtifacts(env, state, startedAt);
+  }
+
+  return inspectRunArtifacts(env, state, startedAt);
+}
+
+async function inspectRunArtifacts(env, state, startedAt) {
+  const prefix = getBatchPrefix(state.run_id);
+  let changed = false;
+  let startAfter = state.cleanup.inspect_start_after || undefined;
+
+  while (Date.now() - startedAt < WALL_TIME_BUDGET_MS) {
+    const page = await env.RAW_BUCKET.list({ prefix, startAfter, limit: LIST_LIMIT });
+
+    if (page.objects.length === 0) {
+      if (state.cleanup.status !== 'ready') {
+        state.cleanup.status = 'ready';
+        state.cleanup.ready_at = state.cleanup.ready_at || new Date().toISOString();
+        state.cleanup.inspect_start_after = null;
+        changed = true;
+        log(env, 'info', `Auto-cleanup ready for run ${state.run_id}. Waiting ${Math.round(CLEANUP_GRACE_MS / 60000)} minutes before removing temporary artifacts.`);
+      }
+      return changed;
+    }
+
+    for (const obj of page.objects) {
+      if (isPendingRunArtifact(obj.key)) {
+        const hadCleanupState = state.cleanup.status !== 'pending' || state.cleanup.ready_at !== null || state.cleanup.inspect_start_after !== null;
+        state.cleanup = createInitialCleanupState();
+        if (hadCleanupState) {
+          log(env, 'debug', `Auto-cleanup waiting: pending artifact still exists for run ${state.run_id}: ${obj.key}`);
+        }
+        return hadCleanupState;
+      }
+    }
+
+    state.cleanup.inspect_start_after = page.objects[page.objects.length - 1].key;
+    changed = true;
+
+    if (page.objects.length < LIST_LIMIT) {
+      state.cleanup.status = 'ready';
+      state.cleanup.ready_at = state.cleanup.ready_at || new Date().toISOString();
+      state.cleanup.inspect_start_after = null;
+      log(env, 'info', `Auto-cleanup ready for run ${state.run_id}. Waiting ${Math.round(CLEANUP_GRACE_MS / 60000)} minutes before removing temporary artifacts.`);
+      return true;
+    }
+
+    startAfter = state.cleanup.inspect_start_after || undefined;
+  }
+
+  return changed;
+}
+
+async function deleteRunArtifacts(env, state, startedAt) {
+  const prefix = getBatchPrefix(state.run_id);
+  let changed = false;
+  let startAfter = state.cleanup.delete_start_after || undefined;
+
+  while (Date.now() - startedAt < WALL_TIME_BUDGET_MS) {
+    const page = await env.RAW_BUCKET.list({ prefix, startAfter, limit: LIST_LIMIT });
+
+    if (page.objects.length === 0) {
+      await env.RAW_BUCKET.delete(SEND_STATS_KEY).catch(() => {});
+      Object.assign(state, compactStateAfterCleanup(state));
+      log(env, 'info', `Auto-cleanup complete for run ${state.run_id}. Removed temporary backfill artifacts under ${prefix}.`);
+      return true;
+    }
+
+    const keys = page.objects.map((obj) => obj.key);
+    await deleteR2Keys(env, keys);
+    state.cleanup.deleted_objects += keys.length;
+    state.cleanup.delete_start_after = page.objects[page.objects.length - 1].key;
+    changed = true;
+
+    if (page.objects.length < LIST_LIMIT) {
+      await env.RAW_BUCKET.delete(SEND_STATS_KEY).catch(() => {});
+      Object.assign(state, compactStateAfterCleanup(state));
+      log(env, 'info', `Auto-cleanup complete for run ${state.run_id}. Removed temporary backfill artifacts under ${prefix}.`);
+      return true;
+    }
+
+    startAfter = state.cleanup.delete_start_after || undefined;
+  }
+
+  return changed;
+}
+
+async function deleteR2Keys(env, keys) {
+  if (keys.length === 0) return;
+
+  try {
+    await env.RAW_BUCKET.delete(keys);
+  } catch {
+    await Promise.allSettled(keys.map((key) => env.RAW_BUCKET.delete(key)));
+  }
 }
 
 // ─── HTTP fetch handler ─────────────────────────────────────────────────────
@@ -966,6 +1100,50 @@ function parsePositiveInt(raw, fallback, min) {
   return parsed;
 }
 
+function createInitialCleanupState() {
+  return {
+    status: 'pending',
+    ready_at: null,
+    inspect_start_after: null,
+    delete_start_after: null,
+    deleted_objects: 0,
+    cleaned_at: null,
+  };
+}
+
+function normalizeCleanupState(cleanup) {
+  return {
+    ...createInitialCleanupState(),
+    ...(cleanup && typeof cleanup === 'object' ? cleanup : {}),
+  };
+}
+
+function isPendingRunArtifact(key) {
+  return key.endsWith('.txt') || key.endsWith('.queued');
+}
+
+function compactStateAfterCleanup(state) {
+  const cleanedAt = new Date().toISOString();
+  return {
+    config: state.config,
+    run_id: state.run_id,
+    phase: 'done',
+    status: 'cleaned',
+    started_at: state.started_at,
+    completed_at: state.completed_at,
+    enqueued_count: state.enqueued_count,
+    last_cron_at: state.last_cron_at,
+    cleanup: {
+      status: 'done',
+      ready_at: state.cleanup.ready_at,
+      inspect_start_after: null,
+      delete_start_after: null,
+      deleted_objects: state.cleanup.deleted_objects,
+      cleaned_at: cleanedAt,
+    },
+  };
+}
+
 async function loadExistingStateRunId(env, config) {
   const obj = await env.RAW_BUCKET.get(STATE_KEY).catch(() => null);
   if (!obj) return null;
@@ -978,6 +1156,20 @@ async function loadExistingStateRunId(env, config) {
     return typeof state.run_id === 'string' && state.run_id.trim() ? state.run_id.trim() : null;
   } catch {
     return null;
+  }
+}
+
+async function isRunCleaned(env, runId) {
+  if (!runId) return false;
+
+  const obj = await env.RAW_BUCKET.get(STATE_KEY).catch(() => null);
+  if (!obj) return false;
+
+  try {
+    const state = JSON.parse(await obj.text());
+    return state.run_id === runId && state.status === 'cleaned';
+  } catch {
+    return false;
   }
 }
 
@@ -1103,13 +1295,18 @@ function updateSendStats(stats, outcome) {
 
 export const __test = {
   createSendStats,
+  createInitialCleanupState,
   buildBatchKey,
   buildRunId,
   buildRunInstanceId,
+  compactStateAfterCleanup,
   extractRunIdFromBatchKey,
   extractFileTimeRange,
   getBatchPrefix,
   isRecordInRunWindow,
+  isRunCleaned,
+  isPendingRunArtifact,
+  normalizeCleanupState,
   parseQueueWaitMs,
   normalizeRunContext,
   parseConfig,

@@ -23,6 +23,10 @@ function createFakeBucket() {
       objects.set(key, value);
     },
     async delete(key) {
+      if (Array.isArray(key)) {
+        key.forEach((item) => objects.delete(item));
+        return;
+      }
       objects.delete(key);
     },
   };
@@ -143,4 +147,49 @@ test('updateSendStats aggregates ack and queue wait metrics', () => {
   assert.equal(next.queue_wait_ms_avg, 4500);
   assert.equal(next.last_key, 'processed-backfill/run-1/file-0.txt');
   assert.equal(next.last_bytes, 100);
+});
+
+test('cleanup helpers normalize state and mark pending artifacts correctly', () => {
+  const cleanup = __test.normalizeCleanupState(null);
+
+  assert.equal(cleanup.status, 'pending');
+  assert.equal(cleanup.ready_at, null);
+  assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt'), true);
+  assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt.queued'), true);
+  assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt.done'), false);
+});
+
+test('compactStateAfterCleanup keeps only minimal cleaned marker state', () => {
+  const compacted = __test.compactStateAfterCleanup({
+    config: { start: '2026-04-24T03:15:00Z', end: '2026-04-24T03:30:00Z', rate: 5 },
+    run_id: 'run-1',
+    phase: 'done',
+    status: 'done',
+    started_at: '2026-04-24T04:33:31.353Z',
+    completed_at: '2026-04-24T04:39:31.905Z',
+    enqueued_count: 30,
+    last_cron_at: '2026-04-24T04:39:31.905Z',
+    cleanup: {
+      status: 'deleting',
+      ready_at: '2026-04-24T04:45:00.000Z',
+      deleted_objects: 27,
+    },
+  });
+
+  assert.equal(compacted.status, 'cleaned');
+  assert.equal(compacted.cleanup.status, 'done');
+  assert.equal(compacted.cleanup.deleted_objects, 27);
+  assert.equal(compacted.enqueued_count, 30);
+  assert.equal('enqueue_progress' in compacted, false);
+});
+
+test('isRunCleaned recognizes cleaned completion markers', async () => {
+  const RAW_BUCKET = createFakeBucket();
+  RAW_BUCKET.objects.set('backfill-state/progress.json', JSON.stringify({
+    run_id: 'run-1',
+    status: 'cleaned',
+  }));
+
+  assert.equal(await __test.isRunCleaned({ RAW_BUCKET }, 'run-1'), true);
+  assert.equal(await __test.isRunCleaned({ RAW_BUCKET }, 'run-2'), false);
 });
