@@ -81,8 +81,8 @@ dead_letter_queue  = "send-dlq-backfill"
 #   - 范围最大 48 小时（防误操作）
 #   - Enqueue 阶段按“文件时间范围与 [A,B] 有交集”筛选 raw file
 #   - Parser 阶段再按记录时间逐条裁切，只发送窗口内的日志行
-BACKFILL_START_TIME = ""
-BACKFILL_END_TIME   = ""
+BACKFILL_START_TIME = "2026-04-24T11:15:00+08:00"
+BACKFILL_END_TIME   = "2026-04-24T11:30:00+08:00"
 
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
