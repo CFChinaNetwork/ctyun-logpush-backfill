@@ -173,7 +173,7 @@ footer {
       <div class="card info"><h3>Use case</h3><p>Replay only the historical records inside a precise time window <code>[A, B]</code>.</p></div>
       <div class="card info"><h3>Isolation</h3><p>The backfill Worker uses its own Worker name, Queues, and <code>processed-backfill/&lt;run-id&gt;/</code> prefix.</p></div>
       <div class="card info"><h3>Shared endpoint</h3><p>The customer ingestion endpoint is still shared with production, so the default sender rate stays conservative.</p></div>
-      <div class="card info"><h3>Auto-cleanup</h3><p>After a successful run, temporary batch artifacts are automatically removed from R2.</p></div>
+      <div class="card info"><h3>Auto-cleanup</h3><p>After a successful run, temporary batch artifacts are automatically removed from R2 after a safety delay.</p></div>
     </div>
 
     <div class="card">
@@ -260,7 +260,7 @@ wrangler tail ctyun-logpush-backfill</code></pre>
   <section class="section" id="cleanup">
     <h2 class="title">Cleanup</h2>
     <div class="card">
-      <p>After a successful run, the Worker automatically removes:</p>
+      <p>After a successful run, the Worker automatically removes the temporary artifacts after a safety delay of about 20 minutes:</p>
       <ul>
         <li>All temporary artifacts under <code>processed-backfill/&lt;run-id&gt;/</code></li>
         <li><code>backfill-state/send-stats.json</code></li>

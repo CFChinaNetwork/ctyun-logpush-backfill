@@ -75,7 +75,7 @@ Key status fields:
 
 - Precise record-level replay inside `[BACKFILL_START_TIME, BACKFILL_END_TIME]`
 - Sender hard-capped at `<= 5,000 lines/s` by default
-- Temporary artifacts under `processed-backfill/<run-id>/` are auto-cleaned after a successful run
+- Temporary artifacts under `processed-backfill/<run-id>/` are auto-cleaned after a successful run with a safety delay
 - Sender evidence (`ack_ms`, `queue_wait_ms`) is exposed for troubleshooting and customer communication
 
 ## Documentation
