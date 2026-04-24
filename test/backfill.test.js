@@ -193,3 +193,9 @@ test('isRunCleaned recognizes cleaned completion markers', async () => {
   assert.equal(await __test.isRunCleaned({ RAW_BUCKET }, 'run-1'), true);
   assert.equal(await __test.isRunCleaned({ RAW_BUCKET }, 'run-2'), false);
 });
+
+test('isR2ListComplete follows truncated instead of object count', () => {
+  assert.equal(__test.isR2ListComplete({ objects: new Array(68), truncated: true }), false);
+  assert.equal(__test.isR2ListComplete({ objects: new Array(68), truncated: false }), true);
+  assert.equal(__test.isR2ListComplete({ objects: new Array(1000) }), true);
+});

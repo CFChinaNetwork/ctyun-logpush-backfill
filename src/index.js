@@ -622,7 +622,9 @@ async function runEnqueue(env, state, config, startedAt) {
       if (!pageExhausted) break;  // 当前页被 rate 截断，保留 start_after，下次续
       if (prog.done) break;       // 早停命中，prefix 已完成
 
-      if (list.objects.length < LIST_LIMIT) {
+      // R2 list() 是否还有下一页应以 truncated 为准，不能用返回对象数是否达到 limit 来猜。
+      // 高流量 bucket 里，一页即使少于 limit，也仍可能有更多对象待翻页。
+      if (isR2ListComplete(list)) {
         prog.done = true;
         break;
       }
@@ -1100,6 +1102,10 @@ function parsePositiveInt(raw, fallback, min) {
   return parsed;
 }
 
+function isR2ListComplete(listResult) {
+  return listResult?.truncated !== true;
+}
+
 function createInitialCleanupState() {
   return {
     status: 'pending',
@@ -1304,6 +1310,7 @@ export const __test = {
   extractFileTimeRange,
   getBatchPrefix,
   isRecordInRunWindow,
+  isR2ListComplete,
   isRunCleaned,
   isPendingRunArtifact,
   normalizeCleanupState,
