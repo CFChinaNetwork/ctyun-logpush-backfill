@@ -102,7 +102,7 @@ PARSE_QUEUE_NAME  = "parse-queue-backfill"
 SEND_QUEUE_NAME   = "send-queue-backfill"
 R2_BUCKET_NAME    = "cdn-logs-raw"
 BATCH_SIZE        = "1000"       # 每批 lines 数，与生产 worker 一致
-SEND_TIMEOUT_MS   = "180000"     # 单次发送最长等待 ACK 时间；超时后 retry/DLQ
+SEND_TIMEOUT_MS   = "300000"     # 单次发送最长等待 ACK 时间；超时后 retry/DLQ
 LOG_PREFIX        = "logs/"      # Logpush 写入 R2 的根路径前缀
 LOG_LEVEL         = "info"
 

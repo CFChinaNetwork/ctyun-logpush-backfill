@@ -53,8 +53,8 @@ test('parseConfig builds a canonical window id from the configured window', () =
     __test.buildRunInstanceId(config.startMs, config.endMs, Date.UTC(2026, 3, 24, 1, 2, 3)),
     '20260422T140000Z_20260422T143000Z_20260424T010203Z'
   );
-  assert.equal(__test.parseSendTimeoutMs({ SEND_TIMEOUT_MS: '180000' }), 180000);
-  assert.equal(__test.parseSendTimeoutMs({ SEND_TIMEOUT_MS: '1' }), 180000);
+  assert.equal(__test.parseSendTimeoutMs({ SEND_TIMEOUT_MS: '300000' }), 300000);
+  assert.equal(__test.parseSendTimeoutMs({ SEND_TIMEOUT_MS: '1' }), 300000);
 });
 
 test('writeBatchAndEnqueue skips duplicate queue fanout while a batch is already queued', async () => {

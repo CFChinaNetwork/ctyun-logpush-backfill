@@ -39,7 +39,7 @@ Before deploying, review and adjust `wrangler-backfill.toml`:
 | `BACKFILL_START_TIME` | `""` | e.g. `"2026-04-22T14:00:00Z"` (UTC) or `"2026-04-22T22:00:00+08:00"` (Beijing) |
 | `BACKFILL_END_TIME` | `""` | Must be ≤ now, range ≤ 48h |
 | `BACKFILL_RATE` | `"5"` | Raw files per minute (default 5, max 100) |
-| `SEND_TIMEOUT_MS` | `"180000"` | Max wait for customer ACK before retrying |
+| `SEND_TIMEOUT_MS` | `"300000"` | Max wait for customer ACK before retrying |
 
 ## One-Time Setup
 
@@ -87,6 +87,8 @@ Key fields in status JSON:
 - `enqueue_progress`: per-day-prefix progress
 - `completed_at`: timestamp when enqueue phase finished
 - `send_stats`: sender-side evidence including `ack_ms_avg/max`, `queue_wait_ms_avg/max`, `timeout_count`, `http_error_count`
+
+`queue_wait_ms` is the Worker-side per-message approximation of the Queue dashboard's `Average Consumer Lag Time` for `send-queue-backfill`: both describe how long a message waited between being written to the queue and being consumed. The dashboard metric is queue-native and bucket-averaged; `queue_wait_ms` is emitted per send attempt and correlated with `ack_ms`.
 
 **Important**: `status=done` means all raw files have been **enqueued**. Actual delivery to customer is asynchronous via the rate-limited Sender. Monitor `send-queue-backfill` backlog drain for real completion.
 
@@ -144,7 +146,7 @@ The 4 backfill queues can be left as-is (empty and idle) — next backfill run w
 | `BACKFILL_RATE` | Var | Raw files per cron minute (default 5, max 100) |
 | `BACKFILL_ENABLED` | Var | Set to `"false"` to pause |
 | `BATCH_SIZE` | Var | Log lines per POST (default 1000, same as production) |
-| `SEND_TIMEOUT_MS` | Var | Max time to wait for customer ACK before retrying (default 180000) |
+| `SEND_TIMEOUT_MS` | Var | Max time to wait for customer ACK before retrying (default 300000) |
 | `LOG_PREFIX` | Var | R2 prefix for raw Logpush files (default `"logs/"`) |
 | `LOG_LEVEL` | Var | `info` or `debug` |
 | `PARSE_QUEUE_NAME` | Var | Must match `parse-queue-backfill` |
@@ -182,6 +184,16 @@ Backfill also records sender evidence in two places:
 - Worker logs: ack_ms=<client ACK latency>, queue_wait_ms=<time spent waiting in send-queue-backfill>
 - /backfill/status: aggregated send_stats for the current run
 ```
+
+## Tuning Order
+
+If backfill is slower than expected, adjust in this order:
+
+1. **Increase `SEND_TIMEOUT_MS`** if `ack_ms_max` is close to the timeout and you want to reduce duplicate-causing retries.
+2. **Increase `BATCH_SIZE`** if the customer can accept larger request bodies. This is the safest way to raise lines/sec without increasing requests/sec.
+3. **Increase Sender concurrency cautiously** (`send-queue-backfill max_concurrency` from `1` to `2`, then re-test) only if the customer confirms they can handle more than one extra in-flight POST.
+
+Do **not** expect `BACKFILL_RATE` to improve drain speed; it only makes the backlog grow faster.
 
 **Duration formula (upper-bound estimate)**:
 ```

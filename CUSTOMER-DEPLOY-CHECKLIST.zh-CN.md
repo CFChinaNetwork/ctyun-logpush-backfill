@@ -13,7 +13,7 @@
 - 确认时间范围：`END_TIME <= now`，且总跨度 `<= 48h`
 - 确认 R2 bucket 与生产一致
 - 确认客户 endpoint 与生产一致
-- 确认客户 ACK 慢时的超时设置：默认建议 `SEND_TIMEOUT_MS="180000"`
+- 确认客户 ACK 慢时的超时设置：默认建议 `SEND_TIMEOUT_MS="300000"`
 
 ## 3. wrangler-backfill.toml 需要改的字段
 
@@ -31,7 +31,7 @@
 BACKFILL_START_TIME = "2026-04-22T15:00:00+08:00"
 BACKFILL_END_TIME   = "2026-04-22T19:00:00+08:00"
 BACKFILL_RATE       = "5"
-SEND_TIMEOUT_MS     = "180000"
+SEND_TIMEOUT_MS     = "300000"
 ```
 
 ## 4. 一次性初始化
@@ -80,6 +80,11 @@ curl https://ctyun-logpush-backfill.<your-subdomain>.workers.dev/backfill/status
 - `ack_ms_*`：客户接收端从我们发出 POST 到返回 ACK 的时间
 - `queue_wait_ms_*`：消息在 `send-queue-backfill` 里排队等待被发送的时间
 
+补充说明：
+
+- Queue 控制台里的 `Average Consumer Lag Time`，语义上和这里的 `queue_wait_ms` 很接近，都是“消息进入队列后，等待被 consumer 处理的时间”。
+- 区别是：Dashboard 指标是 Queue 原生、按时间桶聚合后的平均值；`queue_wait_ms` 是我们在 Worker 里按单条 send message 记录的应用侧观测值，并且可以和同一条消息的 `ack_ms` 关联起来看。
+
 ### B. 看实时日志
 
 ```bash
@@ -103,7 +108,20 @@ wrangler tail ctyun-logpush-backfill
 
 这两组数据可以直接拿去和客户沟通，不需要只靠肉眼看 dashboard 曲线猜。
 
-## 8. 什么时候算补传完成
+## 8.1 如果补传速度不够，按这个顺序调
+
+1. 先看 `ack_ms_max` 是否贴近 `SEND_TIMEOUT_MS`
+如果贴近，优先加大 `SEND_TIMEOUT_MS`，避免客户其实收到了但 ACK 回得慢，导致我们误判 retry。
+
+2. 再看客户是否能接受更大的单次请求体
+如果可以，优先提高 `BATCH_SIZE`，这是提高 lines/sec 最安全的方法，因为不会增加 requests/sec，只是每个 POST 带更多日志行。
+
+3. 最后才考虑提高 `send-queue-backfill` 的 `max_concurrency`
+例如从 `1` 提到 `2`。这会直接增加对客户接收端的并发压力，必须先跟客户确认承载能力。
+
+不要指望提高 `BACKFILL_RATE` 来加快 drain，它只会让 backlog 更快变大。
+
+## 9. 什么时候算补传完成
 
 必须同时满足：
 
@@ -112,7 +130,7 @@ wrangler tail ctyun-logpush-backfill
 
 只看到 `status=done` 还不够，那只表示 raw files 已经全部入队，不代表已经全部送达客户。
 
-## 9. 清理
+## 10. 清理
 
 ```bash
 wrangler delete --config wrangler-backfill.toml

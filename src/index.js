@@ -128,7 +128,7 @@ const MAX_RATE              = 100;
 const DEFAULT_RATE          = 5;
 const LIST_LIMIT            = 1000;
 const MAX_DAY_PREFIXES      = 5;
-const DEFAULT_SEND_TIMEOUT_MS = 180_000;
+const DEFAULT_SEND_TIMEOUT_MS = 300_000;
 const MIN_SEND_TIMEOUT_MS     = 1_000;
 const LOG_LEVELS            = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
 
