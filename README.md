@@ -2,11 +2,11 @@
 
 Cloudflare Worker for historical log backfill to CDN partner log ingestion endpoint.
 
-**Fully independent** from production `ctyun-logpush`: dedicated queues, separate R2 prefix (`processed-backfill/`), rate-limited Sender hard-capped at **≤ 5 batches/s (= ≤ 5,000 log lines/s)** via a code-level throttle — the ceiling holds even if the receiving endpoint responds faster than expected. Safe to deploy alongside production without any interference.
+**CF-side fully independent** from production `ctyun-logpush`: dedicated queues, per-run R2 prefix (`processed-backfill/<run-id>/`), rate-limited Sender hard-capped at **≤ 5 batches/s (= ≤ 5,000 log lines/s)** via a code-level throttle. This keeps the backfill pipeline isolated from the production CF pipeline. The customer ingestion endpoint is still shared, so backfill intentionally stays conservative and adds at most **1 extra in-flight POST**.
 
 ## Use Case
 
-When production `ctyun-logpush` missed a specific time range `[A, B]` (e.g. after an upstream outage), deploy this worker to replay those logs to the customer endpoint. Deploy → wait → `wrangler delete`.
+When production `ctyun-logpush` missed a specific time range `[A, B]` (e.g. after an upstream outage), deploy this worker to replay only the log records whose `EdgeStartTimestamp` falls inside that historical window. Deploy → wait → `wrangler delete`.
 
 ## Architecture
 
@@ -14,13 +14,13 @@ When production `ctyun-logpush` missed a specific time range `[A, B]` (e.g. afte
 R2 bucket: cdn-logs-raw (shared with production, prefix-isolated)
   logs/YYYYMMDD/...                 ← Logpush raw files (read-only)
   processed/...                     ← Production worker writes (untouched)
-  processed-backfill/...            ← This worker writes
+  processed-backfill/<run-id>/...   ← This worker writes (run-id = window + this run instance suffix)
   backfill-state/progress.json      ← This worker's state
 
 Backfill pipeline:
   scheduled (1 min cron) → scan logs/ → rate-limited enqueue
          ↓
-  parse-queue-backfill → Parser → processed-backfill/
+  parse-queue-backfill → Parser → processed-backfill/<run-id>/
          ↓
   send-queue-backfill → Sender (max_concurrency=1, max_batch_size=1, throttled ≤ 5 batch/s)
          ↓
@@ -39,6 +39,7 @@ Before deploying, review and adjust `wrangler-backfill.toml`:
 | `BACKFILL_START_TIME` | `""` | e.g. `"2026-04-22T14:00:00Z"` (UTC) or `"2026-04-22T22:00:00+08:00"` (Beijing) |
 | `BACKFILL_END_TIME` | `""` | Must be ≤ now, range ≤ 48h |
 | `BACKFILL_RATE` | `"5"` | Raw files per minute (default 5, max 100) |
+| `SEND_TIMEOUT_MS` | `"180000"` | Max wait for customer ACK before retrying |
 
 ## One-Time Setup
 
@@ -79,11 +80,13 @@ wrangler tail ctyun-logpush-backfill
 ```
 
 Key fields in status JSON:
+- `run_id`: current backfill run identifier (`<window-start>_<window-end>_<run-started-at>`)
 - `phase`: `"enqueue"` or `"done"`
 - `status`: `"running"` or `"done"`
 - `enqueued_count`: total raw files enqueued so far
 - `enqueue_progress`: per-day-prefix progress
 - `completed_at`: timestamp when enqueue phase finished
+- `send_stats`: sender-side evidence including `ack_ms_avg/max`, `queue_wait_ms_avg/max`, `timeout_count`, `http_error_count`
 
 **Important**: `status=done` means all raw files have been **enqueued**. Actual delivery to customer is asynchronous via the rate-limited Sender. Monitor `send-queue-backfill` backlog drain for real completion.
 
@@ -102,6 +105,10 @@ Delivery time ≥ `total_batches ÷ 5 batch/s` (lower bound; actual may be longe
 2. `wrangler deploy --config wrangler-backfill.toml`
 3. Worker auto-detects config change and re-initializes state
 
+Each run writes to its own `processed-backfill/<run-id>/` prefix, so old `.done` markers do not suppress a new run for the same or overlapping time range.
+
+For clean observability, let the previous `send-queue-backfill` backlog drain before starting a new run.
+
 Alternatively, manually delete R2 object `backfill-state/progress.json`.
 
 ## Cleanup
@@ -115,10 +122,12 @@ wrangler delete --config wrangler-backfill.toml
 ### What's left behind in R2
 
 Same behavior as production: **after each successful HTTP POST**, Sender:
-1. Writes a tiny `.done` marker file (content = `"1"`, ~1 byte) under `processed-backfill/{safeKey}-{N}.txt.done` — used to prevent double-sending on Queue retry
+1. Writes a tiny `.done` marker file (content = `"1"`, ~1 byte) under `processed-backfill/<run-id>/{safeKey}-{N}.txt.done` — used to prevent double-sending on Queue retry
 2. **Deletes** the original batch `.txt` file — no longer needed, saves R2 storage
 
-So when backfill completes, `processed-backfill/` contains only `.done` markers (tiny, no actual log data), plus `backfill-state/progress.json` (one state file). These can be manually removed via CF Dashboard / wrangler if desired, but are harmless to leave in place.
+The transient `.queued` marker used to suppress duplicate parser re-enqueue is removed on successful send. If a batch is stuck in retries / DLQ, you may temporarily see both the batch file and its `.queued` marker in that run's prefix.
+
+So when backfill completes, `processed-backfill/<run-id>/` contains only `.done` markers (tiny, no actual log data), plus `backfill-state/progress.json` (one state file). These can be manually removed via CF Dashboard / wrangler if desired, but are harmless to leave in place.
 
 The 4 backfill queues can be left as-is (empty and idle) — next backfill run will reuse them without re-creation.
 
@@ -135,6 +144,7 @@ The 4 backfill queues can be left as-is (empty and idle) — next backfill run w
 | `BACKFILL_RATE` | Var | Raw files per cron minute (default 5, max 100) |
 | `BACKFILL_ENABLED` | Var | Set to `"false"` to pause |
 | `BATCH_SIZE` | Var | Log lines per POST (default 1000, same as production) |
+| `SEND_TIMEOUT_MS` | Var | Max time to wait for customer ACK before retrying (default 180000) |
 | `LOG_PREFIX` | Var | R2 prefix for raw Logpush files (default `"logs/"`) |
 | `LOG_LEVEL` | Var | `info` or `debug` |
 | `PARSE_QUEUE_NAME` | Var | Must match `parse-queue-backfill` |
@@ -156,6 +166,22 @@ Per the customer-supplied formula `concurrency × requests/sec × lines/request`
 ```
 
 **Actual rate may be lower** if the endpoint is slow (e.g. 500ms sendBatch → only 2 batch/s). The cap is a ceiling, not a floor.
+
+Because `max_concurrency=1`, the extra load added to the customer endpoint is also capped by ACK latency:
+
+```
+extra_req_per_sec = min(5, 1000 / ack_ms)
+extra_in_flight_requests = 1
+```
+
+Example: if the customer endpoint takes 2s to ACK, backfill naturally drops to ~0.5 req/s.
+
+Backfill also records sender evidence in two places:
+
+```text
+- Worker logs: ack_ms=<client ACK latency>, queue_wait_ms=<time spent waiting in send-queue-backfill>
+- /backfill/status: aggregated send_stats for the current run
+```
 
 **Duration formula (upper-bound estimate)**:
 ```
@@ -192,18 +218,20 @@ To change the 200ms floor itself (e.g. lift to 400ms or reduce to 100ms), edit `
 
 ## Design Rationale
 
-1. **Why independent queues** — guarantee zero interference with production pipeline.
+1. **Why independent queues** — isolate backfill from the production CF pipeline.
 2. **Why shared R2 bucket** — raw files are the same data source; only `logs/` prefix is read (no write there).
-3. **Why prefix-isolated `processed-backfill/`** — Sender's `.done` idempotency markers must not collide with production's.
-4. **Why `max_concurrency=1` on Sender** — ensures strictly stable rate to the customer endpoint, no burst traffic even if parse-queue-backfill has a backlog.
-5. **Why `END ≤ now` enforced** — prevents misconfigure from scanning current real-time data.
-6. **Why `startAfter` pagination** — mid-execution interruption (worker wall-time budget) resumes without losing files.
-7. **Why config-change auto-reset** — editing `BACKFILL_START/END_TIME` and redeploying is the intuitive way to re-run, no manual state cleanup needed.
+3. **Why per-run `processed-backfill/<run-id>/`** — Sender's `.done` markers from an old run must not collide with a new run.
+4. **Why record-level clipping inside Parser** — backfill enqueues overlapping files, but only emits records whose timestamps are inside `[A, B]`.
+5. **Why single Parser consumer** — sender is the real bottleneck; serializing parser avoids duplicate batch enqueue races under retry / duplicate queue delivery.
+6. **Why `max_concurrency=1` on Sender** — ensures strictly stable rate to the customer endpoint, no burst traffic even if parse-queue-backfill has a backlog.
+7. **Why `END ≤ now` enforced** — prevents misconfigure from scanning current real-time data.
+8. **Why `startAfter` pagination** — mid-execution interruption (worker wall-time budget) resumes without losing files.
+9. **Why config-change auto-reset** — editing `BACKFILL_START/END_TIME` and redeploying is the intuitive way to re-run, no manual state cleanup needed.
 
 ## FAQ
 
 **Q: Does this worker affect production `ctyun-logpush`?**
-A: No. It runs as a separate worker with its own queues, its own R2 prefix. The only shared resource is the R2 bucket (but only `logs/` is read by both; writes go to different prefixes).
+A: It does not share queues or processed prefixes with production, so it cannot block or corrupt the production CF pipeline. However, it still POSTs to the same customer endpoint, so it adds backfill traffic there. Keep the Sender throttle conservative if the endpoint is slow.
 
 **Q: What if the customer endpoint returns 503 during backfill?**
 A: Sender catches the error and calls `msg.retry()`. CF Queue retries up to 5 times with `retry_delay=30s` between attempts. After 5 failures, the message goes to `send-dlq-backfill`. Monitor this DLQ for stuck messages.

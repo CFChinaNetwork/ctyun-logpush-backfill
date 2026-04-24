@@ -5,7 +5,7 @@
 # 和生产 worker(ctyun-logpush)完全独立运行：
 #   - 独立 worker name: ctyun-logpush-backfill
 #   - 独立 queues: parse-queue-backfill / send-queue-backfill (含各自 DLQ)
-#   - 独立 R2 前缀: processed-backfill/ (生产写 processed/)
+#   - 独立 R2 前缀: processed-backfill/<run-id>/ (生产写 processed/)
 #   - 共享 R2 bucket: cdn-logs-raw (对 raw 文件 logs/... 只读)
 #   - Sender 限速双层保证：max_concurrency=1, max_batch_size=1 (config 层)
 #     + handleSendQueue 内 200ms/invocation throttle (code 层)
@@ -43,12 +43,12 @@ binding = "SEND_QUEUE"
 queue   = "send-queue-backfill"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# Parser queue: 处理 raw file 的并发可以快（Parser 读 R2 + 解析 + 写 batch）
+# Parser queue: Sender 才是瓶颈，所以 Parser 保持单 consumer，避免重复消息并发时产生同一 batch 的竞态入队
 [[queues.consumers]]
 queue              = "parse-queue-backfill"
 max_batch_size     = 3
 max_batch_timeout  = 10
-max_concurrency    = 10
+max_concurrency    = 1
 max_retries        = 2
 retry_delay        = 30
 dead_letter_queue  = "parse-dlq-backfill"
@@ -79,8 +79,8 @@ dead_letter_queue  = "send-dlq-backfill"
 #   - START 必须早于 END
 #   - END 必须 ≤ 现在（不能是未来）
 #   - 范围最大 48 小时（防误操作）
-#   - 匹配策略宽松交集：任何和 [A,B] 有时间重叠的文件都补传
-#     (Logpush 文件通常 5min 粒度，两端可能 0-5min 重复，客户监控一般可接受)
+#   - Enqueue 阶段按“文件时间范围与 [A,B] 有交集”筛选 raw file
+#   - Parser 阶段再按记录时间逐条裁切，只发送窗口内的日志行
 BACKFILL_START_TIME = ""
 BACKFILL_END_TIME   = ""
 
@@ -102,6 +102,7 @@ PARSE_QUEUE_NAME  = "parse-queue-backfill"
 SEND_QUEUE_NAME   = "send-queue-backfill"
 R2_BUCKET_NAME    = "cdn-logs-raw"
 BATCH_SIZE        = "1000"       # 每批 lines 数，与生产 worker 一致
+SEND_TIMEOUT_MS   = "180000"     # 单次发送最长等待 ACK 时间；超时后 retry/DLQ
 LOG_PREFIX        = "logs/"      # Logpush 写入 R2 的根路径前缀
 LOG_LEVEL         = "info"
 

@@ -119,14 +119,17 @@ const MAX_UA_LEN  = 1024;
 const MAX_REF_LEN = 2048;
 
 // ⭐ Backfill 专用前缀（和生产的 processed/ 完全隔离）
-const BATCH_PREFIX          = 'processed-backfill/';
+const BATCH_ROOT_PREFIX     = 'processed-backfill/';
 const STATE_KEY             = 'backfill-state/progress.json';
+const SEND_STATS_KEY        = 'backfill-state/send-stats.json';
 const MAX_RANGE_HOURS       = 48;
 const WALL_TIME_BUDGET_MS   = 55_000;       // 留 5s 缓冲给 saveState
 const MAX_RATE              = 100;
 const DEFAULT_RATE          = 5;
 const LIST_LIMIT            = 1000;
 const MAX_DAY_PREFIXES      = 5;
+const DEFAULT_SEND_TIMEOUT_MS = 180_000;
+const MIN_SEND_TIMEOUT_MS     = 1_000;
 const LOG_LEVELS            = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
 
 // ⭐ Sender 节流：每次 handleSendQueue invocation 至少花费 MIN_SENDER_INVOCATION_MS
@@ -159,10 +162,12 @@ export default {
 
 // ─── Parser: R2原始文件 → 流式解析转换 → R2 processed-backfill/ → send-queue-backfill ──
 // 相比生产 Parser：
-//   - 无 PUSH_START_TIME 过滤（backfill 不需要）
-//   - 写入 BATCH_PREFIX = 'processed-backfill/'（独立前缀）
+//   - 逐条按 [BACKFILL_START_TIME, BACKFILL_END_TIME] 裁切，避免边界文件整段重放
+//   - 写入 processed-backfill/<run-id>/（不同 backfill run 互不污染）
 async function handleParseQueue(batch, env) {
-  await Promise.allSettled(batch.messages.map(msg => processFile(msg, env)));
+  for (const msg of batch.messages) {
+    await processFile(msg, env);
+  }
 }
 
 async function processFile(msg, env) {
@@ -173,14 +178,31 @@ async function processFile(msg, env) {
     return;
   }
 
+  const run = await resolveRunContext(msg.body?.run, env);
+  if (!run.valid) {
+    log(env, 'error', `Invalid backfill run for ${key}: ${run.error}`);
+    msg.retry();
+    return;
+  }
+
   log(env, 'info', `Parsing: ${key}`);
   try {
     const object = await env.RAW_BUCKET.get(key);
     if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
     const batchSize = parseInt(env.BATCH_SIZE || '1000', 10);
-    let lines = [], batchIdx = 0, lineCount = 0, errCount = 0;
+    let lines = [], batchIdx = 0, lineCount = 0, errCount = 0, skipped = 0, invalidTs = 0;
     await streamParseNdjsonGzip(object.body, async (record) => {
       lineCount++;
+      const recordMs = parseTimestamp(record.EdgeStartTimestamp);
+      if (recordMs === null) {
+        skipped++;
+        invalidTs++;
+        return;
+      }
+      if (!isRecordInRunWindow(recordMs, run)) {
+        skipped++;
+        return;
+      }
       try {
         lines.push(transformEdge(record));
       } catch (e) {
@@ -189,12 +211,12 @@ async function processFile(msg, env) {
         return;
       }
       if (lines.length >= batchSize) {
-        await writeBatchAndEnqueue(lines, key, batchIdx++, env);
+        await writeBatchAndEnqueue(lines, key, batchIdx++, env, run);
         lines = [];
       }
     });
-    if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env);
-    log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount}`);
+    if (lines.length > 0) await writeBatchAndEnqueue(lines, key, batchIdx++, env, run);
+    log(env, 'info', `Done: ${key} | lines=${lineCount} batches=${batchIdx} errors=${errCount} skipped=${skipped} invalid_ts=${invalidTs} run=${run.id}`);
     msg.ack();
   } catch (err) {
     log(env, 'error', `Failed: ${key}: ${err.message}`);
@@ -202,9 +224,9 @@ async function processFile(msg, env) {
   }
 }
 
-async function writeBatchAndEnqueue(lines, sourceKey, index, env) {
-  const safeKey  = sourceKey.replace(/[^a-zA-Z0-9_-]/g, '_');
-  const batchKey = `${BATCH_PREFIX}${safeKey}-${index}.txt`;
+async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
+  const batchKey        = buildBatchKey(sourceKey, index, run.id);
+  const queuedMarkerKey = `${batchKey}.queued`;
 
   // 幂等检查：该 batch 已被 Backfill Sender 成功发送过时跳过
   const doneMarker = await env.RAW_BUCKET.head(`${batchKey}.done`).catch(() => null);
@@ -212,15 +234,29 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env) {
     log(env, 'debug', `Batch already sent (skip): ${batchKey}`);
     return;
   }
+
+  // Parser retry 场景：如果 batch 已经成功写入并入过 send-queue，则不重复入队。
+  const queuedMarker = await env.RAW_BUCKET.head(queuedMarkerKey).catch(() => null);
+  if (queuedMarker) {
+    log(env, 'debug', `Batch already queued (skip duplicate enqueue): ${batchKey}`);
+    return;
+  }
+
   const body = lines.join('\n') + '\n';
-  await env.RAW_BUCKET.put(batchKey, body, {
-    httpMetadata: { contentType: 'text/plain; charset=utf-8' },
-  });
   try {
-    await env.SEND_QUEUE.send({ key: batchKey });
+    await env.RAW_BUCKET.put(batchKey, body, {
+      httpMetadata: { contentType: 'text/plain; charset=utf-8' },
+    });
+    await env.RAW_BUCKET.put(queuedMarkerKey, '1', {
+      httpMetadata: { contentType: 'text/plain' },
+    });
+    await env.SEND_QUEUE.send({ key: batchKey, queuedAtMs: Date.now(), runId: run.id });
   } catch (e) {
     // 入队失败，回滚 R2 文件，让 parse-queue-backfill 的 retry 机制干净重试
-    await env.RAW_BUCKET.delete(batchKey).catch(() => {});
+    await Promise.allSettled([
+      env.RAW_BUCKET.delete(batchKey),
+      env.RAW_BUCKET.delete(queuedMarkerKey),
+    ]);
     throw e;
   }
   log(env, 'debug', `Queued: ${batchKey} (${lines.length} lines)`);
@@ -253,6 +289,11 @@ async function handleSendQueue(batch, env) {
 async function sendBatch(msg, env) {
   const { key } = msg.body;
   if (!key) throw new Error(`Invalid message: ${JSON.stringify(msg.body)}`);
+  const runId = typeof msg.body?.runId === 'string' && msg.body.runId.trim()
+    ? msg.body.runId.trim()
+    : extractRunIdFromBatchKey(key);
+  const queueWaitMs = parseQueueWaitMs(msg.body?.queuedAtMs);
+  const queuedMarkerKey = `${key}.queued`;
   const doneMarker = await env.RAW_BUCKET.head(`${key}.done`).catch(() => null);
   if (doneMarker) {
     log(env, 'info', `Already sent (skip duplicate): ${key}`);
@@ -277,13 +318,63 @@ async function sendBatch(msg, env) {
     headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Encoding': 'gzip' },
     body: compressed,
   };
-  const resp = await fetch(buildAuthUrl(endpoint, uri, privateKey), fetchInit);
+  const timeoutMs = parseSendTimeoutMs(env);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let resp;
+  const fetchStartedAt = Date.now();
+  try {
+    resp = await fetch(buildAuthUrl(endpoint, uri, privateKey), {
+      ...fetchInit,
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (controller.signal.aborted) {
+      await recordSendOutcome(env, {
+        runId,
+        key,
+        outcome: 'timeout',
+        ackMs: timeoutMs,
+        queueWaitMs,
+        error: `Send timeout after ${timeoutMs}ms`,
+      });
+      throw new Error(`Send timeout after ${timeoutMs}ms`);
+    }
+    await recordSendOutcome(env, {
+      runId,
+      key,
+      outcome: 'other_error',
+      ackMs: Date.now() - fetchStartedAt,
+      queueWaitMs,
+      error: e.message,
+    });
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
+  const ackMs = Date.now() - fetchStartedAt;
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
+    await recordSendOutcome(env, {
+      runId,
+      key,
+      outcome: 'http_error',
+      ackMs,
+      queueWaitMs,
+      error: `HTTP ${resp.status} ${resp.statusText} | ${text.substring(0, 200)}`,
+    });
     throw new Error(`HTTP ${resp.status} ${resp.statusText} | ${text.substring(0, 200)}`);
   }
   await resp.body?.cancel().catch(() => {});
-  log(env, 'info', `Sent ${object.size ?? '?'} bytes (uncompressed) → HTTP ${resp.status} | ${key}`);
+  await recordSendOutcome(env, {
+    runId,
+    key,
+    outcome: 'success',
+    ackMs,
+    queueWaitMs,
+    bytes: object.size ?? null,
+  });
+  log(env, 'info', `Sent ${object.size ?? '?'} bytes (uncompressed) → HTTP ${resp.status} | ack_ms=${ackMs}${queueWaitMs === null ? '' : ` queue_wait_ms=${queueWaitMs}`} | ${key}`);
   let wroteDone = false;
   await env.RAW_BUCKET.put(`${key}.done`, '1', {
     httpMetadata: { contentType: 'text/plain' },
@@ -293,8 +384,16 @@ async function sendBatch(msg, env) {
     log(env, 'warn', `Done marker write failed (keeping batch file for investigation): ${key}: ${e.message}`);
   });
   if (wroteDone) {
-    await env.RAW_BUCKET.delete(key).catch((e) => {
-      log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${e.message}`);
+    await Promise.allSettled([
+      env.RAW_BUCKET.delete(key),
+      env.RAW_BUCKET.delete(queuedMarkerKey),
+    ]).then((results) => {
+      if (results[0].status === 'rejected') {
+        log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${results[0].reason?.message || results[0].reason}`);
+      }
+      if (results[1].status === 'rejected') {
+        log(env, 'warn', `Queued marker cleanup failed: ${queuedMarkerKey}: ${results[1].reason?.message || results[1].reason}`);
+      }
     });
     log(env, 'debug', `Deleted: ${key}`);
   }
@@ -380,6 +479,7 @@ function parseConfig(env) {
   return {
     valid: true,
     start, end, startMs, endMs, rate,
+    windowId: buildRunId(startMs, endMs),
     bucketName: env.R2_BUCKET_NAME || 'cdn-logs-raw',
     logPrefix:  env.LOG_PREFIX     || 'logs/'
   };
@@ -391,6 +491,9 @@ async function loadState(env, config) {
     try {
       const state = JSON.parse(await obj.text());
       if (state.config?.start === config.start && state.config?.end === config.end) {
+        if (!state.run_id) {
+          state.run_id = buildRunInstanceId(config.startMs, config.endMs);
+        }
         return state;
       }
       log(env, 'info', `Config changed (was ${state.config?.start}→${state.config?.end}, now ${config.start}→${config.end}). Re-initializing state.`);
@@ -400,6 +503,7 @@ async function loadState(env, config) {
   }
   return {
     config:           { start: config.start, end: config.end, rate: config.rate },
+    run_id:           buildRunInstanceId(config.startMs, config.endMs),
     phase:            'enqueue',
     status:           'running',
     started_at:       new Date().toISOString(),
@@ -458,7 +562,7 @@ async function runEnqueue(env, state, config, startedAt) {
         prog.start_after = key;  // 推进 startAfter，即使过滤掉也不再重扫
 
         // 防御性过滤（prefix 已经限定 logs/，但保险起见）
-        if (key.startsWith(BATCH_PREFIX))         continue;
+        if (key.startsWith(BATCH_ROOT_PREFIX))    continue;
         if (key.startsWith('backfill-state/'))    continue;
         if (key.startsWith('.recover-done-'))     continue;
         if (key.startsWith('processed/'))         continue;  // 生产的 processed/ 前缀
@@ -482,7 +586,14 @@ async function runEnqueue(env, state, config, startedAt) {
           // 格式与 R2 Event Notification 一致，handleParseQueue 读 msg.body.object.key
           await env.PARSE_QUEUE.send({
             bucket: config.bucketName,
-            object: { key }
+            object: { key },
+            run: {
+              id:      state.run_id,
+              start:   config.start,
+              end:     config.end,
+              startMs: config.startMs,
+              endMs:   config.endMs,
+            }
           });
           enqueuedThisCron++;
           prog.enqueued++;
@@ -541,6 +652,7 @@ async function handleFetch(request, env) {
     }
     try {
       const data = JSON.parse(await obj.text());
+      data.send_stats = await readSendStats(env, data.run_id);
       return jsonResponse(data);
     } catch (e) {
       return jsonResponse({ status: 'error', message: `State file corrupted: ${e.message}` }, 500);
@@ -753,6 +865,122 @@ function extractFileTimeRange(key) {
   return null;
 }
 
+function isRecordInRunWindow(recordMs, run) {
+  return recordMs >= run.startMs && recordMs <= run.endMs;
+}
+
+async function resolveRunContext(run, env) {
+  const normalized = normalizeRunContext(run);
+  if (normalized.valid) return normalized;
+
+  const config = parseConfig(env);
+  if (!config.valid) {
+    return {
+      valid: false,
+      error: normalized.error || config.error,
+    };
+  }
+
+  const stateRunId = await loadExistingStateRunId(env, config);
+  if (!stateRunId) {
+    return {
+      valid: false,
+      error: normalized.error || 'Missing run metadata and no active state.run_id to fall back to.',
+    };
+  }
+
+  return {
+    valid: true,
+    id:      stateRunId,
+    start:   config.start,
+    end:     config.end,
+    startMs: config.startMs,
+    endMs:   config.endMs,
+  };
+}
+
+function normalizeRunContext(run) {
+  if (!run || typeof run !== 'object') {
+    return { valid: false, error: 'Missing run metadata in queue message.' };
+  }
+
+  const id = typeof run.id === 'string' ? run.id.trim() : '';
+  const startMs = Number(run.startMs);
+  const endMs   = Number(run.endMs);
+  if (!id || !Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs >= endMs) {
+    return { valid: false, error: `Malformed run metadata: ${JSON.stringify(run)}` };
+  }
+
+  return {
+    valid: true,
+    id,
+    start: typeof run.start === 'string' ? run.start : new Date(startMs).toISOString(),
+    end:   typeof run.end === 'string'   ? run.end   : new Date(endMs).toISOString(),
+    startMs,
+    endMs,
+  };
+}
+
+function buildRunId(startMs, endMs) {
+  return `${fmtCompactUtc(startMs)}_${fmtCompactUtc(endMs)}`;
+}
+
+function buildRunInstanceId(startMs, endMs, createdAtMs = Date.now()) {
+  return `${buildRunId(startMs, endMs)}_${fmtCompactUtc(createdAtMs)}`;
+}
+
+function fmtCompactUtc(ms) {
+  const d = new Date(ms);
+  const yyyy = d.getUTCFullYear();
+  const mm   = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd   = String(d.getUTCDate()).padStart(2, '0');
+  const hh   = String(d.getUTCHours()).padStart(2, '0');
+  const mi   = String(d.getUTCMinutes()).padStart(2, '0');
+  const ss   = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${yyyy}${mm}${dd}T${hh}${mi}${ss}Z`;
+}
+
+function buildBatchKey(sourceKey, index, runId) {
+  const safeKey = sourceKey.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `${getBatchPrefix(runId)}${safeKey}-${index}.txt`;
+}
+
+function getBatchPrefix(runId) {
+  return `${BATCH_ROOT_PREFIX}${runId}/`;
+}
+
+function extractRunIdFromBatchKey(key) {
+  if (typeof key !== 'string' || !key.startsWith(BATCH_ROOT_PREFIX)) return null;
+  const suffix = key.slice(BATCH_ROOT_PREFIX.length);
+  const slash = suffix.indexOf('/');
+  return slash === -1 ? null : suffix.slice(0, slash) || null;
+}
+
+function parseSendTimeoutMs(env) {
+  return parsePositiveInt(env.SEND_TIMEOUT_MS, DEFAULT_SEND_TIMEOUT_MS, MIN_SEND_TIMEOUT_MS);
+}
+
+function parsePositiveInt(raw, fallback, min) {
+  const parsed = parseInt(raw ?? '', 10);
+  if (isNaN(parsed) || parsed < min) return fallback;
+  return parsed;
+}
+
+async function loadExistingStateRunId(env, config) {
+  const obj = await env.RAW_BUCKET.get(STATE_KEY).catch(() => null);
+  if (!obj) return null;
+
+  try {
+    const state = JSON.parse(await obj.text());
+    if (state.config?.start !== config.start || state.config?.end !== config.end) {
+      return null;
+    }
+    return typeof state.run_id === 'string' && state.run_id.trim() ? state.run_id.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── 根据时间范围生成日期 prefix 列表（限定 R2 list 扫描范围）──────────────
 function getR2PrefixesByDay(startMs, endMs, basePrefix) {
   const prefixes = [];
@@ -777,6 +1005,120 @@ function log(env, level, msg) {
     fn(`[BACKFILL][${level.toUpperCase()}] ${new Date().toISOString()} ${msg}`);
   }
 }
+
+function parseQueueWaitMs(queuedAtMs) {
+  const queuedAt = Number(queuedAtMs);
+  if (!Number.isFinite(queuedAt) || queuedAt <= 0) return null;
+  return Math.max(0, Date.now() - queuedAt);
+}
+
+async function readSendStats(env, runId) {
+  if (!runId) return null;
+
+  const obj = await env.RAW_BUCKET.get(SEND_STATS_KEY).catch(() => null);
+  if (!obj) return null;
+
+  try {
+    const stats = JSON.parse(await obj.text());
+    return stats.run_id === runId ? stats : null;
+  } catch {
+    return null;
+  }
+}
+
+async function recordSendOutcome(env, outcome) {
+  if (!outcome.runId) return;
+
+  try {
+    const current = (await readSendStats(env, outcome.runId)) || createSendStats(outcome.runId);
+    const next = updateSendStats(current, outcome);
+    await env.RAW_BUCKET.put(SEND_STATS_KEY, JSON.stringify(next, null, 2), {
+      httpMetadata: { contentType: 'application/json; charset=utf-8' }
+    });
+  } catch (e) {
+    log(env, 'warn', `Failed to record send stats for ${outcome.key}: ${e.message}`);
+  }
+}
+
+function createSendStats(runId) {
+  return {
+    run_id: runId,
+    success_count: 0,
+    timeout_count: 0,
+    http_error_count: 0,
+    other_error_count: 0,
+    ack_count: 0,
+    ack_ms_sum: 0,
+    ack_ms_avg: null,
+    ack_ms_min: null,
+    ack_ms_max: null,
+    queue_wait_count: 0,
+    queue_wait_ms_sum: 0,
+    queue_wait_ms_avg: null,
+    queue_wait_ms_min: null,
+    queue_wait_ms_max: null,
+    last_ack_ms: null,
+    last_queue_wait_ms: null,
+    last_outcome: null,
+    last_error: null,
+    last_key: null,
+    last_bytes: null,
+    updated_at: null,
+  };
+}
+
+function updateSendStats(stats, outcome) {
+  const next = { ...stats };
+  next.updated_at = new Date().toISOString();
+  next.last_outcome = outcome.outcome;
+  next.last_error = outcome.error ?? null;
+  next.last_key = outcome.key;
+  next.last_bytes = outcome.bytes ?? null;
+
+  if (outcome.outcome === 'success') next.success_count += 1;
+  else if (outcome.outcome === 'timeout') next.timeout_count += 1;
+  else if (outcome.outcome === 'http_error') next.http_error_count += 1;
+  else next.other_error_count += 1;
+
+  if (Number.isFinite(outcome.ackMs)) {
+    next.ack_count += 1;
+    next.ack_ms_sum += outcome.ackMs;
+    next.ack_ms_avg = Math.round(next.ack_ms_sum / next.ack_count);
+    next.ack_ms_min = next.ack_ms_min === null ? outcome.ackMs : Math.min(next.ack_ms_min, outcome.ackMs);
+    next.ack_ms_max = next.ack_ms_max === null ? outcome.ackMs : Math.max(next.ack_ms_max, outcome.ackMs);
+    next.last_ack_ms = outcome.ackMs;
+  }
+
+  if (Number.isFinite(outcome.queueWaitMs)) {
+    next.queue_wait_count += 1;
+    next.queue_wait_ms_sum += outcome.queueWaitMs;
+    next.queue_wait_ms_avg = Math.round(next.queue_wait_ms_sum / next.queue_wait_count);
+    next.queue_wait_ms_min = next.queue_wait_ms_min === null ? outcome.queueWaitMs : Math.min(next.queue_wait_ms_min, outcome.queueWaitMs);
+    next.queue_wait_ms_max = next.queue_wait_ms_max === null ? outcome.queueWaitMs : Math.max(next.queue_wait_ms_max, outcome.queueWaitMs);
+    next.last_queue_wait_ms = outcome.queueWaitMs;
+  }
+
+  return next;
+}
+
+export const __test = {
+  createSendStats,
+  buildBatchKey,
+  buildRunId,
+  buildRunInstanceId,
+  extractRunIdFromBatchKey,
+  extractFileTimeRange,
+  getBatchPrefix,
+  isRecordInRunWindow,
+  parseQueueWaitMs,
+  normalizeRunContext,
+  parseConfig,
+  parseSendTimeoutMs,
+  resolveRunContext,
+  loadExistingStateRunId,
+  updateSendStats,
+  writeBatchAndEnqueue,
+};
 
 // ─── MD5 (RFC 1321, Workers SubtleCrypto不支持MD5) ─────────────────────────
 function md5(str) {
