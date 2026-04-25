@@ -64,8 +64,6 @@ Architecture diagram:
 - Direct preview: [Flow Chart (PNG)](docs/Flow%20Chart.png)
 - Editable source: [Flow Chart (draw.io)](docs/Flow%20Chart.drawio)
 
-![Flow Chart](docs/Flow%20Chart.png)
-
 ## Monitoring
 
 ```bash
