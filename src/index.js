@@ -132,6 +132,7 @@ const LEGACY_SEND_STATS_KEY = 'backfill-state/send-stats.json';
 const MAX_RANGE_HOURS       = 48;
 const WALL_TIME_BUDGET_MS   = 55_000;       // 留 5s 缓冲给 saveState
 const CLEANUP_GRACE_MS      = 24 * 60 * 60_000;
+const FINALIZE_RECOVERY_STALL_MS = 2 * 60_000;
 const MAX_RATE              = 100;
 const DEFAULT_RATE          = 5;
 const LIST_LIMIT            = 1000;
@@ -198,51 +199,65 @@ async function processFile(msg, env) {
     return;
   }
 
-  log(env, 'info', `Parsing: ${key}`);
   try {
-    const object = await env.RAW_BUCKET.get(key);
-    if (!object) { log(env, 'warn', `Not in R2: ${key}`); msg.ack(); return; }
-    const aggregatorChunkLines = parseAggregatorChunkLines(env);
-    const aggregator = getRunAggregatorStub(env, run.id);
-    let lines = [], chunkIdx = 0, lineCount = 0, errCount = 0, skipped = 0, invalidTs = 0, skippedWorker = 0, kept = 0;
-    await streamParseNdjsonGzip(object.body, async (record) => {
-      lineCount++;
-      const recordMs = parseTimestamp(record.EdgeStartTimestamp);
-      if (recordMs === null) {
-        skipped++;
-        invalidTs++;
-        return;
-      }
-      if (!isRecordInRunWindow(recordMs, run)) {
-        skipped++;
-        return;
-      }
-      if (!isTopLevelParentRequest(record)) {
-        skipped++;
-        skippedWorker++;
-        return;
-      }
-      try {
-        lines.push(transformEdge(record));
-        kept++;
-      } catch (e) {
-        errCount++;
-        log(env, 'warn', `Transform err line ${lineCount}: ${e.message}`);
-        return;
-      }
-      if (lines.length >= aggregatorChunkLines) {
-        await sendChunkToAggregator(aggregator, key, chunkIdx++, lines, run);
-        lines = [];
-      }
-    });
-    if (lines.length > 0) await sendChunkToAggregator(aggregator, key, chunkIdx++, lines, run);
-    await markSourceFileComplete(aggregator, key, run);
-    log(env, 'info', `Done: ${key} | lines=${lineCount} kept=${kept} chunks=${chunkIdx} errors=${errCount} skipped=${skipped} invalid_ts=${invalidTs} skipped_worker=${skippedWorker} run=${run.id}`);
+    const result = await processSourceFile(key, run, env);
+    if (result.missing) {
+      msg.ack();
+      return;
+    }
     msg.ack();
   } catch (err) {
     log(env, 'error', `Failed: ${key}: ${err.message}`);
     msg.retry();
   }
+}
+
+async function processSourceFile(key, run, env) {
+  log(env, 'info', `Parsing: ${key}`);
+
+  const object = await env.RAW_BUCKET.get(key);
+  if (!object) {
+    log(env, 'warn', `Not in R2: ${key}`);
+    return { missing: true };
+  }
+
+  const aggregatorChunkLines = parseAggregatorChunkLines(env);
+  const aggregator = getRunAggregatorStub(env, run.id);
+  let lines = [], chunkIdx = 0, lineCount = 0, errCount = 0, skipped = 0, invalidTs = 0, skippedWorker = 0, kept = 0;
+  await streamParseNdjsonGzip(object.body, async (record) => {
+    lineCount++;
+    const recordMs = parseTimestamp(record.EdgeStartTimestamp);
+    if (recordMs === null) {
+      skipped++;
+      invalidTs++;
+      return;
+    }
+    if (!isRecordInRunWindow(recordMs, run)) {
+      skipped++;
+      return;
+    }
+    if (!isTopLevelParentRequest(record)) {
+      skipped++;
+      skippedWorker++;
+      return;
+    }
+    try {
+      lines.push(transformEdge(record));
+      kept++;
+    } catch (e) {
+      errCount++;
+      log(env, 'warn', `Transform err line ${lineCount}: ${e.message}`);
+      return;
+    }
+    if (lines.length >= aggregatorChunkLines) {
+      await sendChunkToAggregator(aggregator, key, chunkIdx++, lines, run);
+      lines = [];
+    }
+  });
+  if (lines.length > 0) await sendChunkToAggregator(aggregator, key, chunkIdx++, lines, run);
+  await markSourceFileComplete(aggregator, key, run);
+  log(env, 'info', `Done: ${key} | lines=${lineCount} kept=${kept} chunks=${chunkIdx} errors=${errCount} skipped=${skipped} invalid_ts=${invalidTs} skipped_worker=${skippedWorker} run=${run.id}`);
+  return { missing: false, kept, chunkIdx, lineCount };
 }
 
 async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
@@ -435,6 +450,7 @@ async function runBackfillScan(env) {
     }
     if (state.status === 'done' && Date.now() - startedAt < WALL_TIME_BUDGET_MS) {
       changed = (await syncAggregatorStatus(env, state)) || changed;
+      changed = (await maybeRecoverIncompleteFiles(env, state, config, startedAt)) || changed;
       changed = (await maybeAutoCleanup(env, state, startedAt)) || changed;
     }
 
@@ -507,6 +523,7 @@ async function loadState(env, config) {
           state.run_id = buildRunInstanceId(config.startMs, config.endMs);
         }
         state.cleanup = normalizeCleanupState(state.cleanup);
+        state.recovery = normalizeRecoveryState(state.recovery);
         state.aggregate = normalizeAggregateStatus(state.aggregate, state.run_id);
         return state;
       }
@@ -531,6 +548,7 @@ async function loadState(env, config) {
     last_cron_at:     null,
     completed_at:     null,
     cleanup:          createInitialCleanupState(),
+    recovery:         createInitialRecoveryState(),
     aggregate:        createInitialAggregateStatus(runId),
   };
 }
@@ -674,6 +692,103 @@ async function maybeAutoCleanup(env, state, startedAt) {
   }
 
   return inspectRunArtifacts(env, state, startedAt);
+}
+
+async function maybeRecoverIncompleteFiles(env, state, config, startedAt) {
+  state.recovery = normalizeRecoveryState(state.recovery);
+  const aggregate = normalizeAggregateStatus(state.aggregate, state.run_id);
+  if (!shouldRecoverIncompleteFiles(state, aggregate)) {
+    return false;
+  }
+
+  return recoverFirstIncompleteFile(env, state, config, startedAt);
+}
+
+async function recoverFirstIncompleteFile(env, state, config, startedAt) {
+  const prefixes = getR2PrefixesByDay(config.startMs, config.endMs, config.logPrefix);
+  if (prefixes.length === 0) return false;
+
+  let prefixIndex = Number.isInteger(state.recovery.prefix_index) ? state.recovery.prefix_index : 0;
+  if (prefixIndex < 0 || prefixIndex >= prefixes.length) {
+    prefixIndex = 0;
+  }
+
+  let changed = false;
+  while (Date.now() - startedAt < WALL_TIME_BUDGET_MS && prefixIndex < prefixes.length) {
+    const prefix = prefixes[prefixIndex];
+    const page = await env.RAW_BUCKET.list({
+      prefix,
+      startAfter: state.recovery.scan_start_after || undefined,
+      limit: LIST_LIMIT,
+    });
+
+    if (page.objects.length === 0) {
+      prefixIndex += 1;
+      state.recovery.prefix_index = prefixIndex;
+      state.recovery.scan_start_after = null;
+      changed = true;
+      continue;
+    }
+
+    for (const obj of page.objects) {
+      const key = obj.key;
+      state.recovery.last_checked_at = new Date().toISOString();
+      state.recovery.prefix_index = prefixIndex;
+      state.recovery.scan_start_after = key;
+      changed = true;
+
+      if (key.startsWith(BATCH_ROOT_PREFIX) || key.startsWith('backfill-state/') || key.startsWith('.recover-done-') || key.startsWith('processed/')) {
+        continue;
+      }
+
+      const range = extractFileTimeRange(key);
+      if (!range) continue;
+      if (range.startMs > config.endMs || range.endMs < config.startMs) continue;
+
+      if (await isSourceFileComplete(env, state.run_id, key)) {
+        continue;
+      }
+
+      const run = normalizeRunContext({
+        id: state.run_id,
+        start: config.start,
+        end: config.end,
+        startMs: config.startMs,
+        endMs: config.endMs,
+      });
+      if (!run.valid) {
+        throw new Error(`Invalid run during recovery: ${run.error}`);
+      }
+
+      const result = await processSourceFile(key, run, env);
+      state.recovery.last_recovered_key = key;
+      state.recovery.last_recovered_at = new Date().toISOString();
+      if (!result.missing) {
+        state.recovery.recovered_files += 1;
+        state.aggregate = normalizeAggregateStatus(
+          await finalizeAggregatorIfReady(env, state.run_id, state.enqueued_count),
+          state.run_id,
+        );
+      }
+      log(env, 'info', `[Recovery] Reprocessed incomplete raw file for run ${state.run_id}: ${key}`);
+      return true;
+    }
+
+    if (isR2ListComplete(page)) {
+      prefixIndex += 1;
+      state.recovery.prefix_index = prefixIndex;
+      state.recovery.scan_start_after = null;
+      continue;
+    }
+  }
+
+  if (prefixIndex >= prefixes.length) {
+    state.recovery.prefix_index = 0;
+    state.recovery.scan_start_after = null;
+    return true;
+  }
+
+  return changed;
 }
 
 async function inspectRunArtifacts(env, state, startedAt) {
@@ -1330,8 +1445,16 @@ function isTopLevelParentRequest(record) {
   return String(record?.ParentRayID ?? '') === '00' && record?.WorkerSubrequest !== true && record?.WorkerSubrequest !== 'true';
 }
 
+function sanitizeStorageKey(key) {
+  return String(key || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
 function buildAggregateChunkId(sourceKey, index) {
-  return `${sourceKey.replace(/[^a-zA-Z0-9_-]/g, '_')}-${index}`;
+  return `${sanitizeStorageKey(sourceKey)}-${index}`;
+}
+
+function buildFileMarkerKey(sourceKey) {
+  return `file:${sanitizeStorageKey(sourceKey)}`;
 }
 
 function buildFinalBatchKey(runId, index) {
@@ -1439,6 +1562,15 @@ async function markSourceFileComplete(stub, sourceKey, run) {
   });
 }
 
+async function isSourceFileComplete(env, runId, sourceKey) {
+  if (!runId || !sourceKey) return false;
+  const result = await callAggregator(getRunAggregatorStub(env, runId), '/is-file-complete', {
+    runId,
+    sourceKey,
+  });
+  return result?.complete === true;
+}
+
 async function finalizeAggregatorIfReady(env, runId, expectedFiles) {
   return callAggregator(getRunAggregatorStub(env, runId), '/finalize', {
     runId,
@@ -1523,6 +1655,56 @@ function normalizeCleanupState(cleanup) {
     ...createInitialCleanupState(),
     ...(cleanup && typeof cleanup === 'object' ? cleanup : {}),
   };
+}
+
+function createInitialRecoveryState() {
+  return {
+    prefix_index: 0,
+    scan_start_after: null,
+    last_checked_at: null,
+    last_recovered_at: null,
+    last_recovered_key: null,
+    recovered_files: 0,
+  };
+}
+
+function normalizeRecoveryState(recovery) {
+  return {
+    ...createInitialRecoveryState(),
+    ...(recovery && typeof recovery === 'object' ? recovery : {}),
+  };
+}
+
+function shouldRecoverIncompleteFiles(state, aggregate, nowMs = Date.now()) {
+  const expectedFiles = Number.isFinite(aggregate?.expected_files)
+    ? aggregate.expected_files
+    : (state?.enqueued_count ?? 0);
+  if (state?.status !== 'done' || aggregate?.finalized === true || expectedFiles <= 0) {
+    return false;
+  }
+  if ((aggregate?.completed_files ?? 0) >= expectedFiles) {
+    return false;
+  }
+
+  const lastProgressMs = maxDateMs(
+    aggregate?.updated_at,
+    state?.completed_at,
+    state?.recovery?.last_recovered_at,
+  );
+  if (lastProgressMs === null) {
+    return true;
+  }
+  return nowMs - lastProgressMs >= FINALIZE_RECOVERY_STALL_MS;
+}
+
+function maxDateMs(...values) {
+  let max = null;
+  for (const value of values) {
+    const ms = Date.parse(value || '');
+    if (!Number.isFinite(ms)) continue;
+    max = max === null ? ms : Math.max(max, ms);
+  }
+  return max;
 }
 
 function isPendingRunArtifact(key) {
@@ -1647,6 +1829,8 @@ export class RunAggregator extends DurableObjectBase {
         return jsonResponse(await this.ingest(body));
       case '/complete-file':
         return jsonResponse(await this.completeFile(body));
+      case '/is-file-complete':
+        return jsonResponse(await this.isFileComplete(body));
       case '/finalize':
         return jsonResponse(await this.finalize(body));
       case '/mark-sent':
@@ -1719,7 +1903,7 @@ export class RunAggregator extends DurableObjectBase {
       throw new Error('Aggregator complete-file requires runId and sourceKey.');
     }
 
-    const fileMarkerKey = `file:${sourceKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const fileMarkerKey = buildFileMarkerKey(sourceKey);
     let state;
     await this.withStorageTxn(async (txn) => {
       state = normalizeAggregateStatus(await txn.get('state'), runId);
@@ -1734,6 +1918,20 @@ export class RunAggregator extends DurableObjectBase {
     });
     state = await this.flushPendingBatches(state);
     return this.toPublicState(state);
+  }
+
+  async isFileComplete(body) {
+    const runId = String(body?.runId || '').trim();
+    const sourceKey = String(body?.sourceKey || '').trim();
+    if (!runId || !sourceKey) {
+      throw new Error('Aggregator is-file-complete requires runId and sourceKey.');
+    }
+
+    return {
+      run_id: runId,
+      sourceKey,
+      complete: Boolean(await this.ctx.storage.get(buildFileMarkerKey(sourceKey))),
+    };
   }
 
   async finalize(body) {
@@ -1929,11 +2127,13 @@ export class RunAggregator extends DurableObjectBase {
 
 export const __test = {
   applyBatchTelemetry,
+  buildFileMarkerKey,
   buildParseQueueMessage,
   buildNotStartedStatusResponse,
   buildPublicStatusMessage,
   buildPublicStatusResponse,
   createInitialCleanupState,
+  createInitialRecoveryState,
   createInitialAggregateStatus,
   derivePublicStatusStage,
   buildBatchKey,
@@ -1954,10 +2154,12 @@ export const __test = {
   isPendingCleanupArtifact,
   isPendingRunArtifact,
   normalizeCleanupState,
+  normalizeRecoveryState,
   parseAggregatorChunkLines,
   normalizeRunContext,
   parseConfig,
   parseSendTimeoutMs,
+  shouldRecoverIncompleteFiles,
   resolveRunContext,
   deleteR2Keys,
   loadExistingStateRunId,

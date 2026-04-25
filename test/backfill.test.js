@@ -280,16 +280,37 @@ test('buildPublicStatusResponse explains legacy runs without exact line totals',
 
 test('cleanup helpers normalize state and mark pending artifacts correctly', () => {
   const cleanup = __test.normalizeCleanupState(null);
+  const recovery = __test.normalizeRecoveryState(null);
   const aggregate = __test.normalizeAggregateStatus({ pending_batch_ids: ['00000001', '00000002'] }, 'run-1');
 
   assert.equal(cleanup.status, 'pending');
   assert.equal(cleanup.ready_at, null);
+  assert.equal(recovery.prefix_index, 0);
+  assert.equal(recovery.scan_start_after, null);
   assert.equal(aggregate.pending_batch_count, 2);
   assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt'), true);
   assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt.queued'), true);
   assert.equal(__test.isPendingRunArtifact('processed-backfill/run-1/file-0.txt.done'), false);
   assert.equal(__test.canReinitializeFromState({ status: 'cleaned' }), true);
   assert.equal(__test.canReinitializeFromState({ status: 'done' }), false);
+});
+
+test('shouldRecoverIncompleteFiles becomes true after a finalization stall', () => {
+  const state = {
+    status: 'done',
+    completed_at: '2026-04-25T16:41:31.240Z',
+    enqueued_count: 32,
+    recovery: __test.createInitialRecoveryState(),
+  };
+  const aggregate = __test.normalizeAggregateStatus({
+    expected_files: 32,
+    completed_files: 31,
+    finalized: false,
+    updated_at: '2026-04-25T16:41:38.266Z',
+  }, 'run-1');
+
+  assert.equal(__test.shouldRecoverIncompleteFiles(state, aggregate, Date.parse('2026-04-25T16:42:30.000Z')), false);
+  assert.equal(__test.shouldRecoverIncompleteFiles(state, aggregate, Date.parse('2026-04-25T16:44:00.000Z')), true);
 });
 
 test('compactStateAfterCleanup keeps only minimal cleaned marker state', () => {
