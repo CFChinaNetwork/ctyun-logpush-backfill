@@ -28,7 +28,6 @@
  * HTTP Endpoints:
  *   GET  /backfill/status — 返回面向客户的简明进度视图
  *   GET  /backfill/status?view=raw — 返回原始 backfill-state/progress.json
- *   POST /backfill/admin/requeue-current-run — 内部恢复：把当前 run 对应时间窗的 raw files 重送回同一个 run_id
  */
 'use strict';
 
@@ -925,23 +924,6 @@ async function handleFetch(request, env) {
     }
   }
 
-  if (url.pathname === '/backfill/admin/requeue-current-run') {
-    const authError = validateAdminRequest(request, env);
-    if (authError) return authError;
-
-    try {
-      const state = await loadCurrentBackfillState(env);
-      const result = await requeueCurrentRun(env, state);
-      return jsonResponse({
-        status: 'ok',
-        message: `Requeued ${result.requeued_count} raw files back into parse-queue-backfill for run ${state.run_id}.`,
-        ...result,
-      });
-    } catch (e) {
-      return jsonResponse({ status: 'error', message: e.message }, 400);
-    }
-  }
-
   if (url.pathname === '/' || url.pathname === '') {
     return new Response(
       'ctyun-logpush-backfill worker\n' +
@@ -958,96 +940,6 @@ function jsonResponse(obj, status = 200) {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' }
   });
-}
-
-function validateAdminRequest(request, env) {
-  if (request.method !== 'POST') {
-    return jsonResponse({ status: 'error', message: 'Method Not Allowed' }, 405);
-  }
-
-  const configuredToken = String(env.BACKFILL_ADMIN_TOKEN || '').trim();
-  if (!configuredToken) {
-    return jsonResponse({ status: 'error', message: 'BACKFILL_ADMIN_TOKEN is not configured.' }, 500);
-  }
-
-  const authHeader = request.headers.get('authorization') || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-  if (token !== configuredToken) {
-    return jsonResponse({ status: 'error', message: 'Forbidden' }, 403);
-  }
-
-  return null;
-}
-
-async function loadCurrentBackfillState(env) {
-  const obj = await env.RAW_BUCKET.get(STATE_KEY).catch(() => null);
-  if (!obj) {
-    throw new Error('No current backfill state found.');
-  }
-
-  const state = JSON.parse(await obj.text());
-  if (!state?.run_id || !state?.config?.start || !state?.config?.end) {
-    throw new Error('Current state is missing run_id or time window config.');
-  }
-
-  return state;
-}
-
-async function requeueCurrentRun(env, state) {
-  const run = normalizeRunContext({
-    id: state.run_id,
-    start: state.config.start,
-    end: state.config.end,
-    startMs: new Date(state.config.start).getTime(),
-    endMs: new Date(state.config.end).getTime(),
-  });
-  if (!run.valid) {
-    throw new Error(`Invalid current run state: ${run.error}`);
-  }
-
-  const config = parseConfig({
-    BACKFILL_START_TIME: state.config.start,
-    BACKFILL_END_TIME: state.config.end,
-    BACKFILL_RATE: String(state.config.rate || DEFAULT_RATE),
-    R2_BUCKET_NAME: env.R2_BUCKET_NAME,
-    LOG_PREFIX: env.LOG_PREFIX,
-  });
-  if (!config.valid) {
-    throw new Error(`Invalid current run config: ${config.error}`);
-  }
-
-  const prefixes = getR2PrefixesByDay(run.startMs, run.endMs, config.logPrefix);
-  let requeued = 0;
-
-  for (const prefix of prefixes) {
-    let startAfter;
-    while (true) {
-      const page = await env.RAW_BUCKET.list({ prefix, startAfter, limit: LIST_LIMIT });
-      if (page.objects.length === 0) break;
-
-      for (const obj of page.objects) {
-        const key = obj.key;
-        if (key.startsWith(BATCH_ROOT_PREFIX) || key.startsWith('backfill-state/') || key.startsWith('.recover-done-') || key.startsWith('processed/')) {
-          continue;
-        }
-
-        const range = extractFileTimeRange(key);
-        if (!range) continue;
-        if (range.startMs > run.endMs || range.endMs < run.startMs) continue;
-
-        await env.PARSE_QUEUE.send(buildParseQueueMessage(key, config, run.id));
-        requeued++;
-      }
-
-      if (isR2ListComplete(page)) break;
-      startAfter = page.objects[page.objects.length - 1].key;
-    }
-  }
-
-  return {
-    run_id: run.id,
-    requeued_count: requeued,
-  };
 }
 
 function buildParseQueueMessage(key, config, runId) {
