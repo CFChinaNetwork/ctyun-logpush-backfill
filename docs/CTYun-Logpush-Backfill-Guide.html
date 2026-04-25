@@ -172,8 +172,8 @@ footer {
     <div class="grid">
       <div class="card info"><h3>Use case</h3><p>Replay only the historical records inside a precise time window <code>[A, B]</code>.</p></div>
       <div class="card info"><h3>Isolation</h3><p>The backfill Worker uses its own Worker name, Queues, and <code>processed-backfill/&lt;run-id&gt;/</code> prefix.</p></div>
-      <div class="card info"><h3>Shared endpoint</h3><p>The customer ingestion endpoint is still shared with production, so the default sender rate stays conservative.</p></div>
-      <div class="card info"><h3>Request filter</h3><p>Only top-level requests are sent: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code>. This is a customer-specific requirement to exclude Workers subrequests.</p></div>
+      <div class="card info"><h3>Shared endpoint</h3><p>The customer ingestion endpoint is still shared with production, so the sender rate should be tuned carefully.</p></div>
+      <div class="card info"><h3>Request filter</h3><p>Only top-level requests are sent: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code>.</p></div>
       <div class="card info"><h3>Auto-cleanup</h3><p>After a successful run, temporary batch artifacts are automatically removed from R2 after a long safety delay.</p></div>
     </div>
 
@@ -245,22 +245,32 @@ wrangler tail ctyun-logpush-backfill</code></pre>
   <section class="section" id="tuning">
     <h2 class="title">Tuning</h2>
     <div class="card">
-      <p>Default throughput cap mapping:</p>
+      <p>Current checked-in sender cap mapping:</p>
       <table>
         <tr><th>Parameter</th><th>Plain meaning</th></tr>
         <tr><td><code>BATCH_SIZE = 1000</code></td><td>Each HTTP POST can carry up to <code>1000</code> log lines.</td></tr>
-        <tr><td><code>max_concurrency = 1</code></td><td>Only <code>1</code> sender invocation runs at the same time.</td></tr>
+        <tr><td><code>max_concurrency = 10</code></td><td>Up to <code>10</code> sender invocations can run at the same time.</td></tr>
         <tr><td><code>max_batch_size = 1</code></td><td>Each sender invocation handles only <code>1</code> send-queue message, which is effectively one POST.</td></tr>
         <tr><td><code>MIN_SENDER_INVOCATION_MS = 200</code></td><td>Each sender invocation takes at least <code>200ms</code>, which caps the sender at <code>5</code> sends per second.</td></tr>
       </table>
       <pre><code>lines/s cap
 = max_concurrency × max_batch_size × (1000 / MIN_SENDER_INVOCATION_MS) × BATCH_SIZE
-= 1 × 1 × 5 × 1000
-= 5000 lines/s</code></pre>
-      <p>Actual speed is often lower because the sender naturally slows down when the customer ACK is slow.</p>
+= 10 × 1 × 5 × 1000
+= 50000 lines/s</code></pre>
+      <p>Actual speed can still be lower if the customer ACK is slower than 200ms, but this configuration defines the current theoretical ceiling.</p>
       <div class="tip warn">
-        Recommended tuning order: first increase <code>SEND_TIMEOUT_MS</code> if the customer ACK is close to timing out; then increase <code>BATCH_SIZE</code> if the endpoint can accept larger POST bodies; only then consider increasing sender concurrency. Raising <code>BACKFILL_RATE</code> alone will only make backlog grow faster.
+        Recommended tuning order: first increase sender <code>max_concurrency</code> gradually while keeping <code>max_batch_size = 1</code>; only change <code>max_batch_size</code> later if the endpoint has already proven it can handle the extra in-flight POSTs.
       </div>
+      <table>
+        <tr><th>Target ceiling</th><th>Suggested setting</th><th>Comment</th></tr>
+        <tr><td>5,000 lines/s</td><td><code>max_concurrency = 1</code></td><td>Lowest pressure on the customer endpoint.</td></tr>
+        <tr><td>10,000 lines/s</td><td><code>max_concurrency = 2</code></td><td>Good first step when ACK stays in the low hundreds of milliseconds.</td></tr>
+        <tr><td>20,000 lines/s</td><td><code>max_concurrency = 4</code></td><td>Still easy to reason about because one invocation = one POST.</td></tr>
+        <tr><td>30,000 lines/s</td><td><code>max_concurrency = 6</code></td><td>Watch <code>ack_ms</code> and <code>timeout_count</code> closely.</td></tr>
+        <tr><td>40,000 lines/s</td><td><code>max_concurrency = 8</code></td><td>Use only after the endpoint has stayed stable at 30k.</td></tr>
+        <tr><td>50,000 lines/s</td><td><code>max_concurrency = 10</code></td><td>Current checked-in example.</td></tr>
+      </table>
+      <p>Raising <code>BACKFILL_RATE</code> only feeds raw files into the parser faster. It does not change the final sender ceiling.</p>
     </div>
   </section>
 

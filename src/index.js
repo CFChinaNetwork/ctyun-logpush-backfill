@@ -3,8 +3,8 @@
  *
  * 专用于补传指定时间范围 [BACKFILL_START_TIME, BACKFILL_END_TIME] 的 Logpush 日志。
  * 和生产 worker(ctyun-logpush)完全独立：独立 queues、独立 processed-backfill/ 前缀、
- * 独立 Sender 限速（max_concurrency=1 × max_batch_size=1 + 代码级 200ms/invocation 节流
- *   → 严格 ≤ 5 batch/s = 5,000 lines/s，不受接收端 RTT 波动影响）
+ * 独立 Sender 限速（当前 checked-in 配置：max_concurrency=10 × max_batch_size=1
+ *   + 代码级 200ms/invocation 节流 → 理论上限 ≤ 50 batch/s = 50,000 lines/s）
  * 共享同一个 R2 bucket：只读 logs/ 前缀，写入独立的 processed-backfill/ 和 backfill-state/。
  *
  * Architecture:
@@ -16,8 +16,7 @@
  *                           ↓
  *                      processed-backfill/ → send-queue-backfill
  *                           ↓
- *                      Backfill Sender (max_concurrency=1, max_batch_size=1,
- *                                       code-throttled to ≤ 5 invocations/s)
+ *                      Backfill Sender (code-throttled to ≤ 5 invocations/s per consumer)
  *                           ↓
  *                      接收端服务器（与生产同一个 endpoint，共用同样的 CTYUN_* secrets）
  *
@@ -141,8 +140,8 @@ const MIN_SEND_TIMEOUT_MS     = 1_000;
 const LOG_LEVELS            = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
 
 // ⭐ Sender 节流：每次 handleSendQueue invocation 至少花费 MIN_SENDER_INVOCATION_MS
-// 配合 max_concurrency=1 (无并行 invocation) + max_batch_size=1 (每 invocation 1 条 msg)
-//   → 严格保证 ≤ 5 invocations/s = 5 msg/s = 5,000 lines/s 的发送上限
+// 配合 max_batch_size=1 (每 invocation 1 条 msg)
+//   → 每个 sender consumer 最多约 5 msg/s；总 ceiling 还取决于 wrangler 里的 max_concurrency
 // 若 sendBatch 实际耗时已超过此值（如接收端慢），不 sleep，以实际耗时为准（更慢）
 // 若接收端非常快（<200ms），sleep 补齐到 200ms，确保不会因 endpoint 抖动而突破上限
 // 注：sleep 只占 wall time，不占 CPU time，不增加 Worker 计费
@@ -297,7 +296,7 @@ async function handleSendQueue(batch, env) {
   });
 
   // 节流：确保本次 invocation 至少占用 MIN_SENDER_INVOCATION_MS
-  // 这保证了 "invocation/s" 的代码级上限，配合 max_concurrency=1 严格限制吞吐
+  // 这保证了单个 sender consumer 的 "invocation/s" 上限；总吞吐还要乘上 wrangler 的 max_concurrency
   const elapsed = Date.now() - invocationStart;
   if (elapsed < MIN_SENDER_INVOCATION_MS) {
     const sleepMs = MIN_SENDER_INVOCATION_MS - elapsed;

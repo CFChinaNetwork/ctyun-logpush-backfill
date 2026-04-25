@@ -171,9 +171,9 @@ footer {
     <h2 class="title">概述</h2>
     <div class="grid">
       <div class="card info"><h3>用途</h3><p>精确回放指定时间窗 <code>[A, B]</code> 内的历史日志，不影响生产 CF 内部链路。</p></div>
-      <div class="card info"><h3>共享资源</h3><p>Backfill 与生产共享同一个客户接收 endpoint，因此默认发送速率保持保守。</p></div>
-      <div class="card info"><h3>默认上限</h3><p>默认发送上限为 <code>&lt;= 5,000 行/秒</code>，实际速率取决于客户 ACK 时间与日志批次大小。</p></div>
-      <div class="card info"><h3>请求过滤</h3><p>仅处理父请求 / top-level requests：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code>。这是客户的特殊要求，用来排除 Workers 子请求。</p></div>
+      <div class="card info"><h3>共享资源</h3><p>Backfill 与生产共享同一个客户接收 endpoint，因此发送速率需要谨慎调节。</p></div>
+      <div class="card info"><h3>默认上限</h3><p>当前仓库配置的发送上限为 <code>&lt;= 50,000 行/秒</code>，实际速率仍取决于客户 ACK 时间与日志批次大小。</p></div>
+      <div class="card info"><h3>请求过滤</h3><p>仅处理父请求 / top-level requests：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code>。</p></div>
       <div class="card info"><h3>自动清理</h3><p>成功完成后会在一个较长的安全等待期后自动清理 <code>processed-backfill/&lt;run-id&gt;/</code> 和发送统计文件，尽量不在客户 R2 留下尾巴。</p></div>
     </div>
 
@@ -245,22 +245,32 @@ wrangler tail ctyun-logpush-backfill</code></pre>
   <section class="section" id="tuning">
     <h2 class="title">调速</h2>
     <div class="card">
-      <p>默认发送速度上限的参数对应关系：</p>
+      <p>当前仓库配置的发送速度上限参数对应关系：</p>
       <table>
         <tr><th>参数</th><th>直白解释</th></tr>
         <tr><td><code>BATCH_SIZE = 1000</code></td><td>每次 POST 最多带 <code>1000</code> 条日志。</td></tr>
-        <tr><td><code>max_concurrency = 1</code></td><td>同时最多只有 <code>1</code> 个 sender invocation 在跑。</td></tr>
+        <tr><td><code>max_concurrency = 10</code></td><td>同时最多允许 <code>10</code> 个 sender invocation 在跑。</td></tr>
         <tr><td><code>max_batch_size = 1</code></td><td>每个 sender invocation 只处理 <code>1</code> 个 send queue message，也就是大致只发 <code>1</code> 个 POST。</td></tr>
         <tr><td><code>MIN_SENDER_INVOCATION_MS = 200</code></td><td>每个 invocation 至少占用 <code>200ms</code>，对应每秒最多 <code>5</code> 次发送。</td></tr>
       </table>
       <pre><code>lines/s 上限
 = max_concurrency × max_batch_size × (1000 / MIN_SENDER_INVOCATION_MS) × BATCH_SIZE
-= 1 × 1 × 5 × 1000
-= 5000 行/秒</code></pre>
-      <p>实际速率通常会低于这个上限，因为客户 ACK 慢时，sender 会自然降速。</p>
+= 10 × 1 × 5 × 1000
+= 50000 行/秒</code></pre>
+      <p>如果客户 ACK 时间超过 200ms，实际速率仍会低于这个上限，但这就是当前 checked-in 配置对应的理论 ceiling。</p>
       <div class="tip warn">
-        调速建议顺序：先看 <code>SEND_TIMEOUT_MS</code> 是否太短；再考虑增大 <code>BATCH_SIZE</code>；最后才考虑增加 sender 并发。不要指望提高 <code>BACKFILL_RATE</code> 来加快 drain，它只会让 backlog 增长更快。
+        调速建议顺序：优先逐步提高 sender 的 <code>max_concurrency</code>，并先保持 <code>max_batch_size = 1</code> 不变；只有在客户 endpoint 已经证明能稳定承受更高并发时，再考虑动 <code>max_batch_size</code>。
       </div>
+      <table>
+        <tr><th>目标 ceiling</th><th>推荐设置</th><th>说明</th></tr>
+        <tr><td>5,000 行/秒</td><td><code>max_concurrency = 1</code></td><td>对客户接收端冲击最小。</td></tr>
+        <tr><td>10,000 行/秒</td><td><code>max_concurrency = 2</code></td><td>如果 ACK 长期在数百毫秒，适合作为第一档。</td></tr>
+        <tr><td>20,000 行/秒</td><td><code>max_concurrency = 4</code></td><td>仍然容易理解：一个 invocation 大致对应一个 POST。</td></tr>
+        <tr><td>30,000 行/秒</td><td><code>max_concurrency = 6</code></td><td>要开始重点盯 <code>ack_ms</code> 和 <code>timeout_count</code>。</td></tr>
+        <tr><td>40,000 行/秒</td><td><code>max_concurrency = 8</code></td><td>建议在 30k 稳定后再提高。</td></tr>
+        <tr><td>50,000 行/秒</td><td><code>max_concurrency = 10</code></td><td>当前仓库配置示例。</td></tr>
+      </table>
+      <p>提高 <code>BACKFILL_RATE</code> 只会更快把 raw 文件送进 parser，不会改变最终 sender ceiling。</p>
     </div>
   </section>
 

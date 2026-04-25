@@ -7,9 +7,9 @@
 #   - 独立 queues: parse-queue-backfill / send-queue-backfill (含各自 DLQ)
 #   - 独立 R2 前缀: processed-backfill/<run-id>/ (生产写 processed/)
 #   - 共享 R2 bucket: cdn-logs-raw (对 raw 文件 logs/... 只读)
-#   - Sender 限速双层保证：max_concurrency=1, max_batch_size=1 (config 层)
+#   - Sender 限速双层保证：max_concurrency=10, max_batch_size=1 (config 层)
 #     + handleSendQueue 内 200ms/invocation throttle (code 层)
-#     → ≤ 5 batch/s = ≤ 5,000 lines/s 硬上限，不受接收端 RTT 波动影响
+#     → 当前 checked-in 配置的理论硬上限：≤ 50 batch/s = ≤ 50,000 lines/s
 #
 # 一次性部署流程（见 README.md）：
 #   1. 改 account_id 和 BACKFILL_START/END_TIME
@@ -92,7 +92,7 @@ BACKFILL_END_TIME   = ""
 
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
-# 默认 5: 每分钟入 5 个 raw file；Consumer 上限 ≤ 5 batch/s 消费（由 code-level throttle 保证）
+# 当前示例 20: 每分钟入 20 个 raw file
 # Consumer 端的 max_concurrency=10 + max_batch_size=1 + MIN_SENDER_INVOCATION_MS=200 是真正决定接收端冲击速率的参数
 # 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（CF Queue 100K 容量内安全）
 # 补传总时长 ≥ 总 batches ÷ 5 batch/s（上限估算，实际若接收端慢会更长）
