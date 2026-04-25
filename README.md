@@ -80,7 +80,7 @@ Key status fields:
 ## Safety Defaults
 
 - Precise record-level replay inside `[BACKFILL_START_TIME, BACKFILL_END_TIME]`
-- Only top-level requests are sent (`ParentRayID = "00"` and `WorkerSubrequest != true`)
+- Only top-level requests are sent (`ParentRayID = "00"` and `WorkerSubrequest != true`) because excluding Workers subrequests is a customer-specific requirement
 - Sender hard-capped at `<= 5,000 lines/s` by default
 - Temporary artifacts under `processed-backfill/<run-id>/` are auto-cleaned after a successful run with a long safety delay
 - Sender evidence (`ack_ms`, `queue_wait_ms`) is exposed for troubleshooting and customer communication

@@ -173,7 +173,7 @@ footer {
       <div class="card info"><h3>Use case</h3><p>Replay only the historical records inside a precise time window <code>[A, B]</code>.</p></div>
       <div class="card info"><h3>Isolation</h3><p>The backfill Worker uses its own Worker name, Queues, and <code>processed-backfill/&lt;run-id&gt;/</code> prefix.</p></div>
       <div class="card info"><h3>Shared endpoint</h3><p>The customer ingestion endpoint is still shared with production, so the default sender rate stays conservative.</p></div>
-      <div class="card info"><h3>Request filter</h3><p>Only top-level requests are sent: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code>.</p></div>
+      <div class="card info"><h3>Request filter</h3><p>Only top-level requests are sent: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code>. This is a customer-specific requirement to exclude Workers subrequests.</p></div>
       <div class="card info"><h3>Auto-cleanup</h3><p>After a successful run, temporary batch artifacts are automatically removed from R2 after a long safety delay.</p></div>
     </div>
 

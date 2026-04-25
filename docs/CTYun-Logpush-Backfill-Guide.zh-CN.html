@@ -173,7 +173,7 @@ footer {
       <div class="card info"><h3>用途</h3><p>精确回放指定时间窗 <code>[A, B]</code> 内的历史日志，不影响生产 CF 内部链路。</p></div>
       <div class="card info"><h3>共享资源</h3><p>Backfill 与生产共享同一个客户接收 endpoint，因此默认发送速率保持保守。</p></div>
       <div class="card info"><h3>默认上限</h3><p>默认发送上限为 <code>&lt;= 5,000 行/秒</code>，实际速率取决于客户 ACK 时间与日志批次大小。</p></div>
-      <div class="card info"><h3>请求过滤</h3><p>仅处理父请求 / top-level requests：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code>。</p></div>
+      <div class="card info"><h3>请求过滤</h3><p>仅处理父请求 / top-level requests：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code>。这是客户的特殊要求，用来排除 Workers 子请求。</p></div>
       <div class="card info"><h3>自动清理</h3><p>成功完成后会在一个较长的安全等待期后自动清理 <code>processed-backfill/&lt;run-id&gt;/</code> 和发送统计文件，尽量不在客户 R2 留下尾巴。</p></div>
     </div>
 
