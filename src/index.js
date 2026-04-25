@@ -785,6 +785,11 @@ async function recoverFirstIncompleteFile(env, state, config, startedAt) {
   if (prefixIndex >= prefixes.length) {
     state.recovery.prefix_index = 0;
     state.recovery.scan_start_after = null;
+    state.aggregate = normalizeAggregateStatus(
+      await reconcileAggregatorCompletedFiles(env, state.run_id, state.enqueued_count, state.enqueued_count),
+      state.run_id,
+    );
+    log(env, 'warn', `[Recovery] Reconciled completed_files drift for run ${state.run_id} after verifying all raw files were already complete.`);
     return true;
   }
 
@@ -1571,6 +1576,14 @@ async function isSourceFileComplete(env, runId, sourceKey) {
   return result?.complete === true;
 }
 
+async function reconcileAggregatorCompletedFiles(env, runId, completedFiles, expectedFiles) {
+  return callAggregator(getRunAggregatorStub(env, runId), '/reconcile-completed-files', {
+    runId,
+    completedFiles,
+    expectedFiles,
+  });
+}
+
 async function finalizeAggregatorIfReady(env, runId, expectedFiles) {
   return callAggregator(getRunAggregatorStub(env, runId), '/finalize', {
     runId,
@@ -1831,6 +1844,8 @@ export class RunAggregator extends DurableObjectBase {
         return jsonResponse(await this.completeFile(body));
       case '/is-file-complete':
         return jsonResponse(await this.isFileComplete(body));
+      case '/reconcile-completed-files':
+        return jsonResponse(await this.reconcileCompletedFiles(body));
       case '/finalize':
         return jsonResponse(await this.finalize(body));
       case '/mark-sent':
@@ -1932,6 +1947,49 @@ export class RunAggregator extends DurableObjectBase {
       sourceKey,
       complete: Boolean(await this.ctx.storage.get(buildFileMarkerKey(sourceKey))),
     };
+  }
+
+  async reconcileCompletedFiles(body) {
+    const runId = String(body?.runId || '').trim();
+    const completedFiles = Number(body?.completedFiles);
+    const expectedFiles = Number(body?.expectedFiles);
+    if (!runId) {
+      throw new Error('Aggregator reconcile-completed-files requires runId.');
+    }
+
+    let state;
+    await this.withStorageTxn(async (txn) => {
+      state = normalizeAggregateStatus(await txn.get('state'), runId);
+      if (Number.isFinite(completedFiles) && completedFiles >= 0) {
+        state.completed_files = Math.max(state.completed_files, completedFiles);
+      }
+      if (Number.isFinite(expectedFiles) && expectedFiles >= 0) {
+        state.expected_files = Math.max(state.expected_files ?? 0, expectedFiles);
+      }
+
+      if (!state.finalized && state.expected_files !== null && state.completed_files >= state.expected_files) {
+        let buffer = await this.loadBufferFrom(txn);
+        if (buffer.length > 0) {
+          const seq = state.next_batch_seq++;
+          const pendingId = buildPendingBatchId(seq);
+          const batchKey = buildFinalBatchKey(runId, seq);
+          await txn.put(`pending-batch:${pendingId}`, { id: pendingId, batchKey, lines: buffer });
+          state.pending_batch_ids.push(pendingId);
+          buffer = [];
+        }
+        await this.saveBufferTo(txn, buffer);
+        state.pending_batch_count = state.pending_batch_ids.length;
+        state.pending_buffer_lines = 0;
+        state.finalized = true;
+        state.finalized_at = new Date().toISOString();
+        state.updated_at = state.finalized_at;
+      }
+
+      await txn.put('state', state);
+    });
+
+    state = await this.flushPendingBatches(state);
+    return this.toPublicState(state);
   }
 
   async finalize(body) {
