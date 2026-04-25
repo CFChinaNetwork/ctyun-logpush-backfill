@@ -99,7 +99,7 @@ BACKFILL_END_TIME   = "2026-04-25T11:00:00+08:00"
 BACKFILL_RATE = "20"
 
 # ==== 可选开关 ====
-BACKFILL_ENABLED = "false"       # 临时关闭：用于停掉当前 run 并做一次彻底清理
+BACKFILL_ENABLED = "true"        # 已重新启用：从干净状态启动一次全新验证 run
 
 # ==== 其他参数 ====
 # 下面 queue/bucket 名字需和本文件 [[queues.*]] / [[r2_buckets]] 的定义一致
