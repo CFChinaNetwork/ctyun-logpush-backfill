@@ -96,6 +96,30 @@ test('parseConfig builds a canonical window id from the configured window', () =
   assert.equal(__test.parseSendTimeoutMs({ SEND_TIMEOUT_MS: '1' }), 300000);
 });
 
+test('buildParseQueueMessage preserves run metadata for parser retries', () => {
+  const config = __test.parseConfig({
+    BACKFILL_START_TIME: '2026-04-25T10:40:00+08:00',
+    BACKFILL_END_TIME: '2026-04-25T11:00:00+08:00',
+    BACKFILL_RATE: '20',
+    R2_BUCKET_NAME: 'cdn-logs-raw',
+    LOG_PREFIX: 'logs/',
+  });
+
+  const message = __test.buildParseQueueMessage('logs/20260425/foo.log.gz', config, 'run-1');
+
+  assert.deepEqual(message, {
+    bucket: 'cdn-logs-raw',
+    object: { key: 'logs/20260425/foo.log.gz' },
+    run: {
+      id: 'run-1',
+      start: '2026-04-25T10:40:00+08:00',
+      end: '2026-04-25T11:00:00+08:00',
+      startMs: config.startMs,
+      endMs: config.endMs,
+    },
+  });
+});
+
 test('writeBatchAndEnqueue skips duplicate queue fanout while a batch is already queued', async () => {
   const RAW_BUCKET = createFakeBucket();
   const sent = [];
