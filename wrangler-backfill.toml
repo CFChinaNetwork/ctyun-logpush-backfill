@@ -62,17 +62,15 @@ retry_delay        = 30
 dead_letter_queue  = "parse-dlq-backfill"
 
 # ⭐ Sender queue: 关键限速点（对接收端的实际冲击速率）
-# max_concurrency=1 保证同时只有 1 个 consumer 实例 → 严格串行
 # max_batch_size=1 每批 1 条 send
 # 代码层 MIN_SENDER_INVOCATION_MS=200 节流 (src/index.js) → 每 invocation 至少 200ms
-# 组合效果：≤ 5 batch/s = ≤ 5,000 行/s 代码级硬上限（不受接收端 RTT 波动影响）
+# 组合效果：max_concurrency=10 时，理论硬上限为 ≤ 50 batch/s = ≤ 50,000 行/s
 # retry_delay=30 失败时等 30s 再试 → 保护接收端不被重试风暴
-# 若需加速可调大 max_batch_size/max_concurrency，但需先与客户接收端确认承压能力
 [[queues.consumers]]
 queue              = "send-queue-backfill"
 max_batch_size     = 1
 max_batch_timeout  = 5
-max_concurrency    = 1
+max_concurrency    = 10
 max_retries        = 5
 retry_delay        = 30
 dead_letter_queue  = "send-dlq-backfill"
@@ -95,7 +93,7 @@ BACKFILL_END_TIME   = ""
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
 # 默认 5: 每分钟入 5 个 raw file；Consumer 上限 ≤ 5 batch/s 消费（由 code-level throttle 保证）
-# Consumer 端的 max_concurrency=1 + max_batch_size=1 + MIN_SENDER_INVOCATION_MS=200 是真正决定接收端冲击速率的参数
+# Consumer 端的 max_concurrency=10 + max_batch_size=1 + MIN_SENDER_INVOCATION_MS=200 是真正决定接收端冲击速率的参数
 # 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（CF Queue 100K 容量内安全）
 # 补传总时长 ≥ 总 batches ÷ 5 batch/s（上限估算，实际若接收端慢会更长）
 BACKFILL_RATE = "20"
