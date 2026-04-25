@@ -26,7 +26,8 @@
  *               BACKFILL_RATE, BACKFILL_ENABLED
  *
  * HTTP Endpoints:
- *   GET /backfill/status — 返回 R2 里的 backfill-state/progress.json
+ *   GET /backfill/status — 返回面向客户的简明进度视图
+ *   GET /backfill/status?view=raw — 返回原始 backfill-state/progress.json
  */
 'use strict';
 
@@ -126,7 +127,7 @@ const MAX_REF_LEN = 2048;
 // ⭐ Backfill 专用前缀（和生产的 processed/ 完全隔离）
 const BATCH_ROOT_PREFIX     = 'processed-backfill/';
 const STATE_KEY             = 'backfill-state/progress.json';
-const SEND_STATS_KEY        = 'backfill-state/send-stats.json';
+const LEGACY_SEND_STATS_KEY = 'backfill-state/send-stats.json';
 const MAX_RANGE_HOURS       = 48;
 const WALL_TIME_BUDGET_MS   = 55_000;       // 留 5s 缓冲给 saveState
 const CLEANUP_GRACE_MS      = 24 * 60 * 60_000;
@@ -269,7 +270,7 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
     await env.RAW_BUCKET.put(queuedMarkerKey, '1', {
       httpMetadata: { contentType: 'text/plain' },
     });
-    await env.SEND_QUEUE.send({ key: batchKey, queuedAtMs: Date.now(), runId: run.id });
+    await env.SEND_QUEUE.send({ key: batchKey, queuedAtMs: Date.now(), runId: run.id, lineCount: lines.length });
   } catch (e) {
     // 入队失败，回滚 R2 文件，让 parse-queue-backfill 的 retry 机制干净重试
     await Promise.allSettled([
@@ -311,7 +312,7 @@ async function sendBatch(msg, env) {
   const runId = typeof msg.body?.runId === 'string' && msg.body.runId.trim()
     ? msg.body.runId.trim()
     : extractRunIdFromBatchKey(key);
-  const queueWaitMs = parseQueueWaitMs(msg.body?.queuedAtMs);
+  const lineCount = parseBatchLineCount(msg.body?.lineCount);
   const queuedMarkerKey = `${key}.queued`;
   const doneMarker = await env.RAW_BUCKET.head(`${key}.done`).catch(() => null);
   if (doneMarker) {
@@ -357,24 +358,8 @@ async function sendBatch(msg, env) {
     });
   } catch (e) {
     if (controller.signal.aborted) {
-      await recordSendOutcome(env, {
-        runId,
-        key,
-        outcome: 'timeout',
-        ackMs: timeoutMs,
-        queueWaitMs,
-        error: `Send timeout after ${timeoutMs}ms`,
-      });
       throw new Error(`Send timeout after ${timeoutMs}ms`);
     }
-    await recordSendOutcome(env, {
-      runId,
-      key,
-      outcome: 'other_error',
-      ackMs: Date.now() - fetchStartedAt,
-      queueWaitMs,
-      error: e.message,
-    });
     throw e;
   } finally {
     clearTimeout(timeout);
@@ -382,26 +367,10 @@ async function sendBatch(msg, env) {
   const ackMs = Date.now() - fetchStartedAt;
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
-    await recordSendOutcome(env, {
-      runId,
-      key,
-      outcome: 'http_error',
-      ackMs,
-      queueWaitMs,
-      error: `HTTP ${resp.status} ${resp.statusText} | ${text.substring(0, 200)}`,
-    });
     throw new Error(`HTTP ${resp.status} ${resp.statusText} | ${text.substring(0, 200)}`);
   }
   await resp.body?.cancel().catch(() => {});
-  await recordSendOutcome(env, {
-    runId,
-    key,
-    outcome: 'success',
-    ackMs,
-    queueWaitMs,
-    bytes: object.size ?? null,
-  });
-  log(env, 'info', `Sent ${object.size ?? '?'} bytes (uncompressed) → HTTP ${resp.status} | ack_ms=${ackMs}${queueWaitMs === null ? '' : ` queue_wait_ms=${queueWaitMs}`} | ${key}`);
+  log(env, 'info', `Sent batch lines=${lineCount ?? '?'} bytes=${object.size ?? '?'} (uncompressed) → HTTP ${resp.status} in ${ackMs}ms | ${key}`);
   let durableSent = false;
   if (runId) {
     try {
@@ -781,7 +750,7 @@ async function deleteRunArtifacts(env, state, startedAt) {
     const page = await env.RAW_BUCKET.list({ prefix, startAfter, limit: LIST_LIMIT });
 
     if (page.objects.length === 0) {
-      await env.RAW_BUCKET.delete(SEND_STATS_KEY).catch(() => {});
+      await env.RAW_BUCKET.delete(LEGACY_SEND_STATS_KEY).catch(() => {});
       Object.assign(state, compactStateAfterCleanup(state));
       log(env, 'info', `Auto-cleanup complete for run ${state.run_id}. Removed temporary backfill artifacts under ${prefix}.`);
       return true;
@@ -798,7 +767,7 @@ async function deleteRunArtifacts(env, state, startedAt) {
     changed = true;
 
     if (isR2ListComplete(page)) {
-      await env.RAW_BUCKET.delete(SEND_STATS_KEY).catch(() => {});
+      await env.RAW_BUCKET.delete(LEGACY_SEND_STATS_KEY).catch(() => {});
       Object.assign(state, compactStateAfterCleanup(state));
       log(env, 'info', `Auto-cleanup complete for run ${state.run_id}. Removed temporary backfill artifacts under ${prefix}.`);
       return true;
@@ -832,21 +801,14 @@ async function handleFetch(request, env) {
   if (url.pathname === '/backfill/status') {
     const obj = await env.RAW_BUCKET.get(STATE_KEY).catch(() => null);
     if (!obj) {
-      return jsonResponse({
-        status: 'not_started',
-        message: 'No backfill state found yet. Ensure BACKFILL_START_TIME and BACKFILL_END_TIME are set in wrangler-backfill.toml and wait for the next Cron trigger (within 1 minute).',
-        config_hint: {
-          BACKFILL_START_TIME: env.BACKFILL_START_TIME || '(unset)',
-          BACKFILL_END_TIME:   env.BACKFILL_END_TIME   || '(unset)',
-          BACKFILL_RATE:       env.BACKFILL_RATE       || String(DEFAULT_RATE),
-          BACKFILL_ENABLED:    env.BACKFILL_ENABLED    || '(default: true)',
-        }
-      });
+      return jsonResponse(buildNotStartedStatusResponse(env));
     }
     try {
       const data = JSON.parse(await obj.text());
-      data.send_stats = await readSendStats(env, data.run_id);
-      return jsonResponse(data);
+      if (url.searchParams.get('view') === 'raw') {
+        return jsonResponse(data);
+      }
+      return jsonResponse(buildPublicStatusResponse(data));
     } catch (e) {
       return jsonResponse({ status: 'error', message: `State file corrupted: ${e.message}` }, 500);
     }
@@ -868,6 +830,89 @@ function jsonResponse(obj, status = 200) {
     status,
     headers: { 'content-type': 'application/json; charset=utf-8' }
   });
+}
+
+function buildNotStartedStatusResponse(env) {
+  return {
+    status: 'not_started',
+    stage: 'waiting_to_start',
+    message: 'Backfill has not started yet. Wait for the next cron run after enabling the worker.',
+    window_start: env.BACKFILL_START_TIME || null,
+    window_end: env.BACKFILL_END_TIME || null,
+    backfill_enabled: env.BACKFILL_ENABLED !== 'false',
+    raw_files_enqueued: 0,
+    batches_handed_to_send_queue: 0,
+    log_lines_handed_to_send_queue: 0,
+    line_count_status: 'exact',
+    average_lines_per_batch: null,
+    smallest_batch_lines: null,
+    largest_batch_lines: null,
+    batches_still_buffered_in_worker: 0,
+    lines_still_buffered_in_worker: 0,
+    started_at: null,
+    enqueue_completed_at: null,
+    last_updated_at: null,
+  };
+}
+
+function buildPublicStatusResponse(state) {
+  const aggregate = normalizeAggregateStatus(state.aggregate, state.run_id);
+  const cleanup = normalizeCleanupState(state.cleanup);
+  const stage = derivePublicStatusStage(state, aggregate, cleanup);
+  const lineCountStatus = aggregate.line_count_tracking === 'exact'
+    ? 'exact'
+    : 'not_available_for_legacy_run';
+
+  return {
+    status: state.status,
+    stage,
+    message: buildPublicStatusMessage(stage, lineCountStatus),
+    run_id: state.run_id,
+    window_start: state.config?.start || null,
+    window_end: state.config?.end || null,
+    raw_files_enqueued: state.enqueued_count ?? 0,
+    batches_handed_to_send_queue: aggregate.emitted_batches,
+    log_lines_handed_to_send_queue: lineCountStatus === 'exact' ? aggregate.emitted_lines : null,
+    line_count_status: lineCountStatus,
+    average_lines_per_batch: aggregate.batch_line_count_avg,
+    smallest_batch_lines: aggregate.batch_line_count_min,
+    largest_batch_lines: aggregate.batch_line_count_max,
+    batches_still_buffered_in_worker: aggregate.pending_batch_count,
+    lines_still_buffered_in_worker: aggregate.pending_buffer_lines,
+    started_at: state.started_at || null,
+    enqueue_completed_at: state.completed_at || null,
+    last_updated_at: aggregate.updated_at || state.last_cron_at || state.started_at || null,
+  };
+}
+
+function derivePublicStatusStage(state, aggregate, cleanup) {
+  if (state.status === 'cleaned') return 'completed_and_cleaned';
+  if (state.phase === 'enqueue') return 'scanning_raw_logs';
+  if (aggregate.finalized !== true) return 'finalizing_batches';
+  if ((aggregate.pending_batch_count ?? 0) > 0 || (aggregate.pending_buffer_lines ?? 0) > 0) {
+    return 'handing_batches_to_send_queue';
+  }
+  if (cleanup.status === 'ready' || cleanup.status === 'deleting') {
+    return 'cleaning_temporary_files';
+  }
+  return 'all_batches_handed_to_send_queue';
+}
+
+function buildPublicStatusMessage(stage, lineCountStatus) {
+  const base = {
+    waiting_to_start: 'Backfill has not started yet.',
+    scanning_raw_logs: 'Worker is still scanning raw log files in the requested time window.',
+    finalizing_batches: 'Raw file scan is complete. Worker is finalizing the last batches.',
+    handing_batches_to_send_queue: 'Worker is still writing batches and handing them to send-queue-backfill.',
+    all_batches_handed_to_send_queue: 'All batches have been handed to send-queue-backfill. Remaining delivery is now in the sender queue.',
+    cleaning_temporary_files: 'Batch handoff is complete. Worker is cleaning temporary backfill artifacts.',
+    completed_and_cleaned: 'Backfill is complete and temporary artifacts have been cleaned.',
+  }[stage] || 'Backfill status is available.';
+
+  if (lineCountStatus !== 'exact') {
+    return `${base} Exact line totals are unavailable for this legacy in-flight run because it started before per-batch line counting was added.`;
+  }
+  return base;
 }
 
 // ─── 流式解析: gzip ndjson → 逐行回调 ─────────────────────────────────────
@@ -1153,6 +1198,12 @@ function parseSendTimeoutMs(env) {
   return parsePositiveInt(env.SEND_TIMEOUT_MS, DEFAULT_SEND_TIMEOUT_MS, MIN_SEND_TIMEOUT_MS);
 }
 
+function parseBatchLineCount(raw) {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+}
+
 function parsePositiveInt(raw, fallback, min) {
   const parsed = parseInt(raw ?? '', 10);
   if (isNaN(parsed) || parsed < min) return fallback;
@@ -1186,6 +1237,12 @@ function createInitialAggregateStatus(runId) {
     completed_files: 0,
     expected_files: null,
     emitted_batches: 0,
+    emitted_lines: 0,
+    line_count_tracking: 'exact',
+    batch_line_count_avg: null,
+    batch_line_count_min: null,
+    batch_line_count_max: null,
+    last_batch_line_count: null,
     next_batch_seq: 0,
     pending_batch_ids: [],
     pending_batch_count: 0,
@@ -1207,7 +1264,46 @@ function normalizeAggregateStatus(status, runId) {
   };
   normalized.pending_batch_ids = Array.isArray(normalized.pending_batch_ids) ? normalized.pending_batch_ids : [];
   normalized.pending_batch_count = normalized.pending_batch_ids.length;
+
+  const hasTrackedLineTotals = Boolean(
+    status
+    && typeof status === 'object'
+    && Object.prototype.hasOwnProperty.call(status, 'emitted_lines')
+  );
+  if (!hasTrackedLineTotals && normalized.emitted_batches > 0) {
+    normalized.emitted_lines = null;
+    normalized.line_count_tracking = 'unavailable_legacy_run';
+    normalized.batch_line_count_avg = null;
+    normalized.batch_line_count_min = null;
+    normalized.batch_line_count_max = null;
+    normalized.last_batch_line_count = null;
+  } else {
+    normalized.line_count_tracking = normalized.line_count_tracking || 'exact';
+  }
   return normalized;
+}
+
+function applyBatchTelemetry(state, lineCount) {
+  if (state.line_count_tracking !== 'exact') return;
+
+  const parsedLineCount = parseBatchLineCount(lineCount);
+  if (parsedLineCount === null) return;
+
+  state.emitted_batches += 1;
+  state.emitted_lines += parsedLineCount;
+  state.batch_line_count_avg = roundMetric(state.emitted_lines / state.emitted_batches, 2);
+  state.batch_line_count_min = state.batch_line_count_min === null
+    ? parsedLineCount
+    : Math.min(state.batch_line_count_min, parsedLineCount);
+  state.batch_line_count_max = state.batch_line_count_max === null
+    ? parsedLineCount
+    : Math.max(state.batch_line_count_max, parsedLineCount);
+  state.last_batch_line_count = parsedLineCount;
+}
+
+function roundMetric(value, digits) {
+  if (!Number.isFinite(value)) return null;
+  return Number(value.toFixed(digits));
 }
 
 function getRunAggregatorStub(env, runId) {
@@ -1279,7 +1375,7 @@ async function writeFinalBatchAndEnqueue(batchKey, lines, env, runId) {
     httpMetadata: { contentType: 'text/plain; charset=utf-8' },
   });
   try {
-    await env.SEND_QUEUE.send({ key: batchKey, queuedAtMs: Date.now(), runId });
+    await env.SEND_QUEUE.send({ key: batchKey, queuedAtMs: Date.now(), runId, lineCount: lines.length });
   } catch (error) {
     await env.RAW_BUCKET.delete(batchKey).catch(() => {});
     throw error;
@@ -1418,101 +1514,6 @@ function log(env, level, msg) {
     const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
     fn(`[BACKFILL][${level.toUpperCase()}] ${new Date().toISOString()} ${msg}`);
   }
-}
-
-function parseQueueWaitMs(queuedAtMs) {
-  const queuedAt = Number(queuedAtMs);
-  if (!Number.isFinite(queuedAt) || queuedAt <= 0) return null;
-  return Math.max(0, Date.now() - queuedAt);
-}
-
-async function readSendStats(env, runId) {
-  if (!runId) return null;
-
-  const obj = await env.RAW_BUCKET.get(SEND_STATS_KEY).catch(() => null);
-  if (!obj) return null;
-
-  try {
-    const stats = JSON.parse(await obj.text());
-    return stats.run_id === runId ? stats : null;
-  } catch {
-    return null;
-  }
-}
-
-async function recordSendOutcome(env, outcome) {
-  if (!outcome.runId) return;
-
-  try {
-    const current = (await readSendStats(env, outcome.runId)) || createSendStats(outcome.runId);
-    const next = updateSendStats(current, outcome);
-    await env.RAW_BUCKET.put(SEND_STATS_KEY, JSON.stringify(next, null, 2), {
-      httpMetadata: { contentType: 'application/json; charset=utf-8' }
-    });
-  } catch (e) {
-    log(env, 'warn', `Failed to record send stats for ${outcome.key}: ${e.message}`);
-  }
-}
-
-function createSendStats(runId) {
-  return {
-    run_id: runId,
-    success_count: 0,
-    timeout_count: 0,
-    http_error_count: 0,
-    other_error_count: 0,
-    ack_count: 0,
-    ack_ms_sum: 0,
-    ack_ms_avg: null,
-    ack_ms_min: null,
-    ack_ms_max: null,
-    queue_wait_count: 0,
-    queue_wait_ms_sum: 0,
-    queue_wait_ms_avg: null,
-    queue_wait_ms_min: null,
-    queue_wait_ms_max: null,
-    last_ack_ms: null,
-    last_queue_wait_ms: null,
-    last_outcome: null,
-    last_error: null,
-    last_key: null,
-    last_bytes: null,
-    updated_at: null,
-  };
-}
-
-function updateSendStats(stats, outcome) {
-  const next = { ...stats };
-  next.updated_at = new Date().toISOString();
-  next.last_outcome = outcome.outcome;
-  next.last_error = outcome.error ?? null;
-  next.last_key = outcome.key;
-  next.last_bytes = outcome.bytes ?? null;
-
-  if (outcome.outcome === 'success') next.success_count += 1;
-  else if (outcome.outcome === 'timeout') next.timeout_count += 1;
-  else if (outcome.outcome === 'http_error') next.http_error_count += 1;
-  else next.other_error_count += 1;
-
-  if (Number.isFinite(outcome.ackMs)) {
-    next.ack_count += 1;
-    next.ack_ms_sum += outcome.ackMs;
-    next.ack_ms_avg = Math.round(next.ack_ms_sum / next.ack_count);
-    next.ack_ms_min = next.ack_ms_min === null ? outcome.ackMs : Math.min(next.ack_ms_min, outcome.ackMs);
-    next.ack_ms_max = next.ack_ms_max === null ? outcome.ackMs : Math.max(next.ack_ms_max, outcome.ackMs);
-    next.last_ack_ms = outcome.ackMs;
-  }
-
-  if (Number.isFinite(outcome.queueWaitMs)) {
-    next.queue_wait_count += 1;
-    next.queue_wait_ms_sum += outcome.queueWaitMs;
-    next.queue_wait_ms_avg = Math.round(next.queue_wait_ms_sum / next.queue_wait_count);
-    next.queue_wait_ms_min = next.queue_wait_ms_min === null ? outcome.queueWaitMs : Math.min(next.queue_wait_ms_min, outcome.queueWaitMs);
-    next.queue_wait_ms_max = next.queue_wait_ms_max === null ? outcome.queueWaitMs : Math.max(next.queue_wait_ms_max, outcome.queueWaitMs);
-    next.last_queue_wait_ms = outcome.queueWaitMs;
-  }
-
-  return next;
 }
 
 export class RunAggregator extends DurableObjectBase {
@@ -1754,9 +1755,11 @@ export class RunAggregator extends DurableObjectBase {
       }
 
       try {
-        await writeFinalBatchAndEnqueue(pending.batchKey, pending.lines, this.env, state.run_id);
+        const { duplicate } = await writeFinalBatchAndEnqueue(pending.batchKey, pending.lines, this.env, state.run_id);
         await deletePendingBatch(this.ctx.storage, pendingId);
-        state.emitted_batches += 1;
+        if (!duplicate) {
+          applyBatchTelemetry(state, pending.lineCount ?? pending.lines?.length);
+        }
         state.last_batch_key = pending.batchKey;
         changed = true;
       } catch (error) {
@@ -1797,24 +1800,29 @@ export class RunAggregator extends DurableObjectBase {
       completed_files: state.completed_files,
       expected_files: state.expected_files,
       emitted_batches: state.emitted_batches,
-      next_batch_seq: state.next_batch_seq,
+      emitted_lines: state.emitted_lines,
+      line_count_tracking: state.line_count_tracking,
+      batch_line_count_avg: state.batch_line_count_avg,
+      batch_line_count_min: state.batch_line_count_min,
+      batch_line_count_max: state.batch_line_count_max,
+      last_batch_line_count: state.last_batch_line_count,
       pending_batch_count: state.pending_batch_count,
-      sent_batch_count: state.emitted_batches,
       pending_buffer_lines: state.pending_buffer_lines,
       finalized: state.finalized,
       finalized_at: state.finalized_at,
-      last_chunk_id: state.last_chunk_id,
-      last_source_key: state.last_source_key,
-      last_batch_key: state.last_batch_key,
       updated_at: state.updated_at,
     };
   }
 }
 
 export const __test = {
-  createSendStats,
+  applyBatchTelemetry,
+  buildNotStartedStatusResponse,
+  buildPublicStatusMessage,
+  buildPublicStatusResponse,
   createInitialCleanupState,
   createInitialAggregateStatus,
+  derivePublicStatusStage,
   buildBatchKey,
   buildRunId,
   buildRunInstanceId,
@@ -1834,14 +1842,12 @@ export const __test = {
   isPendingRunArtifact,
   normalizeCleanupState,
   parseAggregatorChunkLines,
-  parseQueueWaitMs,
   normalizeRunContext,
   parseConfig,
   parseSendTimeoutMs,
   resolveRunContext,
   deleteR2Keys,
   loadExistingStateRunId,
-  updateSendStats,
   writeBatchAndEnqueue,
 };
 

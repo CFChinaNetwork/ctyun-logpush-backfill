@@ -223,21 +223,29 @@ wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml</code></pre>
       <p>最常用的两个观察入口：</p>
       <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill</code></pre>
+      <p>如果要看原始内部状态文件，可以访问 <code>/backfill/status?view=raw</code>。</p>
       <table>
         <tr><th>字段</th><th>怎么理解</th></tr>
-        <tr><td><code>status</code></td><td><code>running</code> 表示还在跑，<code>done</code> 表示 enqueue 阶段完成，<code>cleaned</code> 表示临时文件已自动清理。</td></tr>
-        <tr><td><code>phase</code></td><td><code>enqueue</code> 表示还在扫 raw 文件，<code>done</code> 表示 raw 文件已经扫完。</td></tr>
-        <tr><td><code>enqueued_count</code></td><td>命中的 raw <code>.log.gz</code> 文件数量，不是日志条数。</td></tr>
-        <tr><td><code>send_stats.success_count</code></td><td>成功发给客户的 HTTP POST 次数。</td></tr>
-        <tr><td><code>send_stats.timeout_count</code></td><td>等待客户 ACK 超时次数。</td></tr>
-        <tr><td><code>send_stats.ack_ms_avg/max</code></td><td>客户接收端返回 ACK 的耗时。</td></tr>
-        <tr><td><code>send_stats.queue_wait_ms_avg/max</code></td><td>消息在 <code>send-queue-backfill</code> 里排队等待被处理的时间。</td></tr>
+        <tr><td><code>status</code></td><td>整体生命周期状态：<code>running</code>、<code>done</code>、<code>cleaned</code>。</td></tr>
+        <tr><td><code>stage</code></td><td>当前所处步骤的直白描述，例如还在扫 raw 文件，或者还在把 batch 交给 sender queue。</td></tr>
+        <tr><td><code>message</code></td><td>可以直接转发给客户看的简短说明。</td></tr>
+        <tr><td><code>window_start</code> / <code>window_end</code></td><td>这次补传的精确时间窗。</td></tr>
+        <tr><td><code>raw_files_enqueued</code></td><td>命中的 raw <code>.log.gz</code> 文件数量，不是日志条数。</td></tr>
+        <tr><td><code>batches_handed_to_send_queue</code></td><td>Durable Object 已经写成批次并投递给 <code>send-queue-backfill</code> 的精确 batch 数。</td></tr>
+        <tr><td><code>log_lines_handed_to_send_queue</code></td><td>上述 batch 里的精确日志总条数。对账时优先看这个数字。</td></tr>
+        <tr><td><code>line_count_status</code></td><td><code>exact</code> 表示上面的日志总条数是精确值；<code>not_available_for_legacy_run</code> 表示这个 run 启动时还没有逐 batch 行数统计。</td></tr>
+        <tr><td><code>average_lines_per_batch</code></td><td>每个已发出 batch 的平均行数，只是辅助视图；精确总量仍然看 <code>log_lines_handed_to_send_queue</code>。</td></tr>
+        <tr><td><code>smallest_batch_lines</code> / <code>largest_batch_lines</code></td><td>当前已经发出的 batch 里，最小和最大的实际行数。</td></tr>
+        <tr><td><code>batches_still_buffered_in_worker</code> / <code>lines_still_buffered_in_worker</code></td><td>DO 内还没 flush 进 send queue 的批次数和缓冲行数。</td></tr>
       </table>
       <div class="tip">
-        <strong><code>queue_wait_ms</code> 和 Queue 控制台里的 <code>Average Consumer Lag Time</code> 语义接近：</strong> 都是在看“消息进入队列后，等待被 consumer 处理的时间”。前者是 Worker 按单条消息记录的应用侧观测，后者是 Queue 原生的聚合平均值。
+        attempt 级的 ACK / queue-wait 指标已经不再持久化。原因是 retry、晚到重复消息、timeout 语义都可能让这些数字和“实际客户侧收到多少”产生偏差，不适合作为对账真相源。
       </div>
       <div class="tip ok">
-        如果 <code>ack_ms</code> 高但 <code>queue_wait_ms</code> 低，说明主要是客户 ACK 慢；如果 <code>queue_wait_ms</code> 高但 <code>ack_ms</code> 不高，说明主要是 send queue 在堆积。
+        看 sender 健康度时，用 Worker 日志和 Queue backlog；看 Worker 侧已经交给 send queue 的精确量时，用 <code>batches_handed_to_send_queue</code> 和 <code>log_lines_handed_to_send_queue</code>。
+      </div>
+      <div class="tip warn">
+        如果是在一个已经跑起来的旧版本 run 中途升级到这个版本，<code>aggregate.line_count_tracking</code> 可能会显示 <code>unavailable_legacy_run</code>。这表示历史 batch 生成时还没有保存逐批行数，所以精确总条数只能从这个版本开始的新 run 提供。
       </div>
     </div>
   </section>
@@ -266,7 +274,7 @@ wrangler tail ctyun-logpush-backfill</code></pre>
         <tr><td>5,000 行/秒</td><td><code>max_concurrency = 1</code></td><td>对客户接收端冲击最小。</td></tr>
         <tr><td>10,000 行/秒</td><td><code>max_concurrency = 2</code></td><td>如果 ACK 长期在数百毫秒，适合作为第一档。</td></tr>
         <tr><td>20,000 行/秒</td><td><code>max_concurrency = 4</code></td><td>仍然容易理解：一个 invocation 大致对应一个 POST。</td></tr>
-        <tr><td>30,000 行/秒</td><td><code>max_concurrency = 6</code></td><td>要开始重点盯 <code>ack_ms</code> 和 <code>timeout_count</code>。</td></tr>
+        <tr><td>30,000 行/秒</td><td><code>max_concurrency = 6</code></td><td>要开始重点盯 Queue backlog 和客户侧入库情况。</td></tr>
         <tr><td>40,000 行/秒</td><td><code>max_concurrency = 8</code></td><td>建议在 30k 稳定后再提高。</td></tr>
         <tr><td>50,000 行/秒</td><td><code>max_concurrency = 10</code></td><td>当前仓库配置示例。</td></tr>
       </table>
@@ -286,7 +294,7 @@ wrangler tail ctyun-logpush-backfill</code></pre>
       <p>自动删除的内容：</p>
       <ul>
         <li><code>processed-backfill/&lt;run-id&gt;/</code> 下的所有临时批次文件与 <code>.done</code> 标记</li>
-        <li><code>backfill-state/send-stats.json</code></li>
+        <li>旧版本遗留的 <code>backfill-state/send-stats.json</code>（如果存在）</li>
       </ul>
       <div class="tip">
         为了防止同一配置在 Worker 还部署着时自动重跑，<code>backfill-state/progress.json</code> 会压缩成一个很小的完成标记并继续保留。等 Backfill Worker 不再需要时，删除 Worker 后再删这个小文件即可。

@@ -71,16 +71,27 @@ curl https://ctyun-logpush-backfill.<your-subdomain>.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill
 ```
 
+For the original internal state shape, use `GET /backfill/status?view=raw`.
+
 Key status fields:
 
 - `status`
-- `phase`
+- `stage`
+- `message`
 - `run_id`
-- `enqueued_count`
-- `send_stats.success_count`
-- `send_stats.timeout_count`
-- `send_stats.ack_ms_avg`
-- `send_stats.queue_wait_ms_avg`
+- `window_start`
+- `window_end`
+- `raw_files_enqueued`
+- `batches_handed_to_send_queue`
+- `log_lines_handed_to_send_queue`
+- `line_count_status`
+- `average_lines_per_batch`
+- `smallest_batch_lines`
+- `largest_batch_lines`
+- `batches_still_buffered_in_worker`
+- `lines_still_buffered_in_worker`
+
+If you deploy this change in the middle of an older in-flight run, `line_count_status` may be `not_available_for_legacy_run`; exact line totals start with runs that begin on this version.
 
 ## Safety Defaults
 
@@ -88,7 +99,7 @@ Key status fields:
 - Only top-level requests are sent (`ParentRayID = "00"` and `WorkerSubrequest != true`)
 - Sender hard-capped at `<= 50,000 lines/s` with the current checked-in configuration
 - Temporary artifacts under `processed-backfill/<run-id>/` are auto-cleaned after a successful run with a long safety delay
-- Sender evidence (`ack_ms`, `queue_wait_ms`) is exposed for troubleshooting and customer communication
+- Exact batch and line totals emitted to `send-queue-backfill` are exposed in `progress.json.aggregate`; no attempt-level ACK/queue-wait metrics are persisted
 
 ## Documentation
 

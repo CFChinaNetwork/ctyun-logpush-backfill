@@ -116,6 +116,7 @@ test('writeBatchAndEnqueue skips duplicate queue fanout while a batch is already
   assert.equal(sent.length, 1);
   assert.equal(sent[0].key, batchKey);
   assert.equal(sent[0].runId, run.id);
+  assert.equal(sent[0].lineCount, 1);
   assert.equal(typeof sent[0].queuedAtMs, 'number');
   assert.equal(RAW_BUCKET.objects.has(batchKey), true);
   assert.equal(RAW_BUCKET.objects.has(`${batchKey}.queued`), true);
@@ -165,23 +166,92 @@ test('writeBatchAndEnqueue skips batches already marked done', async () => {
   assert.equal(RAW_BUCKET.objects.has(batchKey), false);
 });
 
-test('updateSendStats aggregates ack and queue wait metrics', () => {
-  const initial = __test.createSendStats('run-1');
-  const next = __test.updateSendStats(initial, {
-    runId: 'run-1',
-    key: 'processed-backfill/run-1/file-0.txt',
-    outcome: 'success',
-    ackMs: 1200,
-    queueWaitMs: 4500,
-    bytes: 100,
+test('applyBatchTelemetry tracks exact emitted line totals and batch size stats', () => {
+  const aggregate = __test.createInitialAggregateStatus('run-1');
+
+  __test.applyBatchTelemetry(aggregate, 1000);
+  __test.applyBatchTelemetry(aggregate, 237);
+
+  assert.equal(aggregate.emitted_batches, 2);
+  assert.equal(aggregate.emitted_lines, 1237);
+  assert.equal(aggregate.batch_line_count_avg, 618.5);
+  assert.equal(aggregate.batch_line_count_min, 237);
+  assert.equal(aggregate.batch_line_count_max, 1000);
+  assert.equal(aggregate.last_batch_line_count, 237);
+});
+
+test('normalizeAggregateStatus marks legacy in-flight runs without line totals as unavailable', () => {
+  const aggregate = __test.normalizeAggregateStatus({ emitted_batches: 5 }, 'run-1');
+
+  assert.equal(aggregate.line_count_tracking, 'unavailable_legacy_run');
+  assert.equal(aggregate.emitted_lines, null);
+  assert.equal(aggregate.batch_line_count_avg, null);
+});
+
+test('buildPublicStatusResponse returns customer-friendly exact totals', () => {
+  const status = __test.buildPublicStatusResponse({
+    status: 'done',
+    phase: 'done',
+    run_id: 'run-1',
+    config: {
+      start: '2026-04-25T02:40:00Z',
+      end: '2026-04-25T03:00:00Z',
+    },
+    enqueued_count: 30,
+    started_at: '2026-04-25T03:01:00Z',
+    completed_at: '2026-04-25T03:05:00Z',
+    last_cron_at: '2026-04-25T03:06:00Z',
+    cleanup: { status: 'pending' },
+    aggregate: {
+      emitted_batches: 11,
+      emitted_lines: 10872,
+      line_count_tracking: 'exact',
+      batch_line_count_avg: 988.36,
+      batch_line_count_min: 872,
+      batch_line_count_max: 1000,
+      pending_batch_ids: [],
+      pending_batch_count: 0,
+      pending_buffer_lines: 0,
+      finalized: true,
+      updated_at: '2026-04-25T03:06:30Z',
+    },
   });
 
-  assert.equal(next.success_count, 1);
-  assert.equal(next.ack_ms_avg, 1200);
-  assert.equal(next.ack_ms_max, 1200);
-  assert.equal(next.queue_wait_ms_avg, 4500);
-  assert.equal(next.last_key, 'processed-backfill/run-1/file-0.txt');
-  assert.equal(next.last_bytes, 100);
+  assert.equal(status.stage, 'all_batches_handed_to_send_queue');
+  assert.equal(status.raw_files_enqueued, 30);
+  assert.equal(status.batches_handed_to_send_queue, 11);
+  assert.equal(status.log_lines_handed_to_send_queue, 10872);
+  assert.equal(status.line_count_status, 'exact');
+  assert.equal(status.smallest_batch_lines, 872);
+  assert.equal(status.largest_batch_lines, 1000);
+  assert.equal(status.last_updated_at, '2026-04-25T03:06:30Z');
+});
+
+test('buildPublicStatusResponse explains legacy runs without exact line totals', () => {
+  const status = __test.buildPublicStatusResponse({
+    status: 'done',
+    phase: 'done',
+    run_id: 'run-1',
+    config: {
+      start: '2026-04-25T02:40:00Z',
+      end: '2026-04-25T03:00:00Z',
+    },
+    enqueued_count: 30,
+    started_at: '2026-04-25T03:01:00Z',
+    completed_at: '2026-04-25T03:05:00Z',
+    cleanup: { status: 'pending' },
+    aggregate: {
+      emitted_batches: 11,
+      pending_batch_ids: [],
+      pending_batch_count: 0,
+      pending_buffer_lines: 0,
+      finalized: true,
+    },
+  });
+
+  assert.equal(status.line_count_status, 'not_available_for_legacy_run');
+  assert.equal(status.log_lines_handed_to_send_queue, null);
+  assert.match(status.message, /legacy in-flight run/);
 });
 
 test('cleanup helpers normalize state and mark pending artifacts correctly', () => {
@@ -215,6 +285,11 @@ test('compactStateAfterCleanup keeps only minimal cleaned marker state', () => {
     },
     aggregate: {
       emitted_batches: 11,
+      emitted_lines: 10872,
+      batch_line_count_avg: 988.36,
+      batch_line_count_min: 872,
+      batch_line_count_max: 1000,
+      last_batch_line_count: 872,
       pending_batch_ids: ['00000001'],
       pending_batch_count: 1,
       finalized: true,
@@ -227,6 +302,8 @@ test('compactStateAfterCleanup keeps only minimal cleaned marker state', () => {
   assert.equal(compacted.cleanup.deleted_objects, 27);
   assert.equal(compacted.enqueued_count, 30);
   assert.equal(compacted.aggregate.emitted_batches, 11);
+  assert.equal(compacted.aggregate.emitted_lines, 10872);
+  assert.equal(compacted.aggregate.batch_line_count_avg, 988.36);
   assert.equal(compacted.aggregate.pending_batch_count, 0);
   assert.equal('enqueue_progress' in compacted, false);
 });

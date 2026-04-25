@@ -223,21 +223,29 @@ wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml</code></pre>
       <p>The two most useful commands are:</p>
       <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill</code></pre>
+      <p>For the original internal state document, use <code>/backfill/status?view=raw</code>.</p>
       <table>
         <tr><th>Field</th><th>Meaning</th></tr>
-        <tr><td><code>status</code></td><td><code>running</code> = in progress, <code>done</code> = enqueue finished, <code>cleaned</code> = temporary artifacts already auto-removed.</td></tr>
-        <tr><td><code>phase</code></td><td><code>enqueue</code> while raw files are still being scanned, <code>done</code> when the raw file scan is finished.</td></tr>
-        <tr><td><code>enqueued_count</code></td><td>Number of raw <code>.log.gz</code> files matched in the requested window.</td></tr>
-        <tr><td><code>send_stats.success_count</code></td><td>Number of successful HTTP POSTs to the customer endpoint.</td></tr>
-        <tr><td><code>send_stats.timeout_count</code></td><td>Number of sender timeouts while waiting for ACK.</td></tr>
-        <tr><td><code>send_stats.ack_ms_avg/max</code></td><td>Customer ACK latency from POST start to ACK received.</td></tr>
-        <tr><td><code>send_stats.queue_wait_ms_avg/max</code></td><td>How long a send message sat in <code>send-queue-backfill</code> before a consumer picked it up.</td></tr>
+        <tr><td><code>status</code></td><td>High-level lifecycle: <code>running</code>, <code>done</code>, or <code>cleaned</code>.</td></tr>
+        <tr><td><code>stage</code></td><td>Human-readable current step, such as scanning raw logs or handing batches to the sender queue.</td></tr>
+        <tr><td><code>message</code></td><td>Short sentence you can forward directly to the customer.</td></tr>
+        <tr><td><code>window_start</code> / <code>window_end</code></td><td>The exact replay time window for this run.</td></tr>
+        <tr><td><code>raw_files_enqueued</code></td><td>How many raw <code>.log.gz</code> files matched the requested window.</td></tr>
+        <tr><td><code>batches_handed_to_send_queue</code></td><td>Exact number of batch files the Durable Object has written and handed to <code>send-queue-backfill</code>.</td></tr>
+        <tr><td><code>log_lines_handed_to_send_queue</code></td><td>Exact total log lines across those emitted batches. Use this as the primary reconciliation number.</td></tr>
+        <tr><td><code>line_count_status</code></td><td><code>exact</code> means the total above is exact; <code>not_available_for_legacy_run</code> means the run started before per-batch line counting existed.</td></tr>
+        <tr><td><code>average_lines_per_batch</code></td><td>Average lines per emitted batch. This is only a convenience view; the exact total is still <code>log_lines_handed_to_send_queue</code>.</td></tr>
+        <tr><td><code>smallest_batch_lines</code> / <code>largest_batch_lines</code></td><td>Smallest and largest emitted batch size seen so far.</td></tr>
+        <tr><td><code>batches_still_buffered_in_worker</code> / <code>lines_still_buffered_in_worker</code></td><td>How many batches or lines are still buffered inside the Durable Object and not yet flushed into send-queue.</td></tr>
       </table>
       <div class="tip">
-        <strong><code>queue_wait_ms</code> vs <code>Average Consumer Lag Time</code>:</strong> the Queue dashboard metric is the queue-native aggregated average; <code>queue_wait_ms</code> is the Worker-side per-message approximation. They should generally point in the same direction.
+        Attempt-level ACK and queue-wait metrics are intentionally no longer persisted. Retries, late duplicates, and timeout ambiguity made them poor "source of truth" counters for customer-side reconciliation.
       </div>
       <div class="tip ok">
-        High <code>ack_ms</code> with low <code>queue_wait_ms</code> means the customer endpoint is slow. High <code>queue_wait_ms</code> with low <code>ack_ms</code> means the sender queue is building backlog.
+        For sender health, use Worker logs plus the Queue backlog view. For exact worker-side handoff volume, rely on <code>batches_handed_to_send_queue</code> and <code>log_lines_handed_to_send_queue</code>.
+      </div>
+      <div class="tip warn">
+        If you deploy this version in the middle of an older in-flight run, <code>aggregate.line_count_tracking</code> can show <code>unavailable_legacy_run</code>. That means older batches were created before per-batch line totals existed, so exact totals are only available for runs that start on this version.
       </div>
     </div>
   </section>
@@ -266,7 +274,7 @@ wrangler tail ctyun-logpush-backfill</code></pre>
         <tr><td>5,000 lines/s</td><td><code>max_concurrency = 1</code></td><td>Lowest pressure on the customer endpoint.</td></tr>
         <tr><td>10,000 lines/s</td><td><code>max_concurrency = 2</code></td><td>Good first step when ACK stays in the low hundreds of milliseconds.</td></tr>
         <tr><td>20,000 lines/s</td><td><code>max_concurrency = 4</code></td><td>Still easy to reason about because one invocation = one POST.</td></tr>
-        <tr><td>30,000 lines/s</td><td><code>max_concurrency = 6</code></td><td>Watch <code>ack_ms</code> and <code>timeout_count</code> closely.</td></tr>
+        <tr><td>30,000 lines/s</td><td><code>max_concurrency = 6</code></td><td>Watch Queue backlog and customer-side ingest closely.</td></tr>
         <tr><td>40,000 lines/s</td><td><code>max_concurrency = 8</code></td><td>Use only after the endpoint has stayed stable at 30k.</td></tr>
         <tr><td>50,000 lines/s</td><td><code>max_concurrency = 10</code></td><td>Current checked-in example.</td></tr>
       </table>
@@ -280,7 +288,7 @@ wrangler tail ctyun-logpush-backfill</code></pre>
       <p>After a successful run, the Worker automatically removes the temporary artifacts after a safety delay of about 1 day:</p>
       <ul>
         <li>All temporary artifacts under <code>processed-backfill/&lt;run-id&gt;/</code></li>
-        <li><code>backfill-state/send-stats.json</code></li>
+        <li>Legacy <code>backfill-state/send-stats.json</code>, if it exists from an older deployment</li>
       </ul>
       <p>The Worker keeps only a tiny <code>backfill-state/progress.json</code> completion marker while the Worker is still deployed. This prevents the same config from replaying again automatically.</p>
       <div class="tip">
