@@ -19,7 +19,7 @@ Before deploying, review and adjust `wrangler-backfill.toml`:
 | `BACKFILL_START_TIME` | `""` | Required start time (ISO 8601) |
 | `BACKFILL_END_TIME` | `""` | Required end time (ISO 8601, must be <= now) |
 | `BACKFILL_ENABLED` | `"false"` | Set to `"true"` only when you are ready to run the replay |
-| `BACKFILL_RATE` | `"100"` | Raw files scanned per cron minute |
+| `BACKFILL_RATE` | `"60"` | Raw files scanned per cron minute |
 | `SEND_TIMEOUT_MS` | `"300000"` | Max wait for customer ACK before retry |
 
 Then set the three Worker secrets:
@@ -95,6 +95,7 @@ Use `GET /backfill/status?view=raw` when you want the raw state file plus low-le
 - Precise record-level replay inside `[BACKFILL_START_TIME, BACKFILL_END_TIME]`
 - Only top-level requests are sent (`ParentRayID = "00"` and `WorkerSubrequest != true`)
 - Sender hard-capped at `<= 100,000 lines/s` with the current checked-in configuration when batches are near the configured `BATCH_SIZE = 1000`
+- Parse queue is intentionally tuned for large raw files: `max_batch_size = 1`, `max_concurrency = 10`
 - Delivery semantics are **at-least-once**, not exactly-once. If a customer POST succeeds but the `.done` marker cannot be persisted, the batch is retried and the receiver should dedupe by batch identity if strict exactly-once is required.
 - Temporary artifacts under `processed-backfill/<run-id>/` are auto-cleaned after a successful run with a long safety delay
 - Sender evidence (`ack_ms`, `queue_wait_ms`) is emitted in Worker logs; `/backfill/status` now also gives a direct batch/log-line reconciliation view without adding a shared hot-path counter

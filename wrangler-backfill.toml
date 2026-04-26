@@ -53,11 +53,11 @@ binding = "SEND_QUEUE"
 queue   = "send-queue-backfill"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# Parser queue: 直接按 raw file 独立解析并切 batch。
-# parse 端可以积极一些，因为真正对客户接收端施压的是 sender cap。
+# Parser queue: 面向大 raw.gz 文件场景，保持“一个 invocation 处理一个原始文件”。
+# 这样单个 20MB+ / 100k-line 文件不会和另外两个大文件共享同一个 invocation 的 CPU 预算。
 [[queues.consumers]]
 queue              = "parse-queue-backfill"
-max_batch_size     = 3
+max_batch_size     = 1
 max_batch_timeout  = 10
 max_concurrency    = 10
 max_retries        = 2
@@ -95,11 +95,11 @@ BACKFILL_END_TIME   = "2026-04-25T11:00:00+08:00"
 
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
-# 默认示例 100: 每分钟最多入 100 个 raw file
+# 默认示例 60: 面向“大文件、单文件约 100k lines、目标 100k lines/s”的更稳妥起点
 # Consumer 端的 max_concurrency=20 + max_batch_size=1 + MIN_SENDER_INVOCATION_MS=200 是真正决定接收端冲击速率的参数
 # 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（CF Queue 100K 容量内安全）
-# 补传总时长 ≥ 总 batches ÷ 100 batch/s（满 1000-line batch 且客户 ACK <200ms 时的上限估算）
-BACKFILL_RATE = "100"
+# 如果单 raw file 过滤后仍接近 100,000 条日志，那么 60 files/min 大致对应 sender 100,000 lines/s 的供给上限
+BACKFILL_RATE = "60"
 
 # ==== 可选开关 ====
 BACKFILL_ENABLED = "true"        # 当前直接启用，用于验证指定时间窗回放

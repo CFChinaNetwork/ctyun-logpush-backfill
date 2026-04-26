@@ -410,9 +410,6 @@ async function runBackfillScan(env) {
       });
     }
 
-    await writePublicStatusSnapshot(env, state).catch((error) => {
-      log(env, 'warn', `Failed to refresh public status snapshot: ${error.message}`);
-    });
   } catch (error) {
     log(env, 'error', `Backfill cron crashed: ${error.message}\n${error.stack}`);
   }

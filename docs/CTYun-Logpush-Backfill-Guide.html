@@ -53,7 +53,7 @@
     <tr><td><code>BACKFILL_START_TIME</code></td><td>Replay start time in ISO 8601</td></tr>
     <tr><td><code>BACKFILL_END_TIME</code></td><td>Replay end time in ISO 8601. Must be in the past.</td></tr>
     <tr><td><code>BACKFILL_ENABLED</code></td><td>Must be set to <code>true</code> to run. The checked-in default is <code>false</code>.</td></tr>
-    <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files cron can enqueue per minute.</td></tr>
+    <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files cron can enqueue per minute. Current checked-in starting point is <code>60</code>.</td></tr>
     <tr><td><code>BATCH_SIZE</code></td><td>Maximum lines per POST. Default <code>1000</code>.</td></tr>
     <tr><td><code>SEND_TIMEOUT_MS</code></td><td>How long sender waits for a customer ACK before retrying.</td></tr>
   </table>
@@ -81,6 +81,7 @@ theoretical ceiling
 = 20 * 1 * (1000 / 200) * 1000
 = 100,000 lines/s</code></pre>
   <p>That ceiling assumes batches are close to 1000 lines and customer ACK stays under 200ms.</p>
+  <p>For large raw files, parse queue is intentionally configured as <code>max_batch_size = 1</code> and <code>max_concurrency = 10</code>, so each large gzip file gets its own invocation instead of sharing CPU time with two other large files.</p>
 
   <table>
     <tr><th>Target ceiling</th><th>Suggested sender max_concurrency</th></tr>

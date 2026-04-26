@@ -54,7 +54,7 @@
     <tr><td><code>BACKFILL_START_TIME</code></td><td>补传开始时间，ISO 8601</td></tr>
     <tr><td><code>BACKFILL_END_TIME</code></td><td>补传结束时间，ISO 8601，且必须是过去时间</td></tr>
     <tr><td><code>BACKFILL_ENABLED</code></td><td>必须显式设成 <code>true</code> 才会运行；checked-in 默认值是 <code>false</code></td></tr>
-    <tr><td><code>BACKFILL_RATE</code></td><td>每分钟最多 enqueue 多少个 raw 文件</td></tr>
+    <tr><td><code>BACKFILL_RATE</code></td><td>每分钟最多 enqueue 多少个 raw 文件。当前 checked-in 起步值是 <code>60</code>。</td></tr>
     <tr><td><code>BATCH_SIZE</code></td><td>每次 POST 最多多少条日志，默认 <code>1000</code></td></tr>
     <tr><td><code>SEND_TIMEOUT_MS</code></td><td>sender 等客户 ACK 的最长时间</td></tr>
   </table>
@@ -82,6 +82,7 @@ BATCH_SIZE = 1000
 = 20 * 1 * (1000 / 200) * 1000
 = 100,000 行/秒</code></pre>
   <p>这个上限默认假设 batch 接近 1000 行，且客户 ACK 小于 200ms。</p>
+  <p>针对大 raw 文件，parse queue 现在特意配置为 <code>max_batch_size = 1</code>、<code>max_concurrency = 10</code>，这样每个大 gzip 文件独占一个 invocation，不会和另外两个大文件共享同一个 invocation 的 CPU 预算。</p>
 
   <table>
     <tr><th>目标 ceiling</th><th>推荐 sender max_concurrency</th></tr>
