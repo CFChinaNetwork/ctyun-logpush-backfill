@@ -33,6 +33,16 @@ preview_urls         = false
 binding     = "RAW_BUCKET"
 bucket_name = "cdn-logs-raw"
 
+# Keep the historical DO migration record and explicitly delete the old class.
+# This removes the previous RunAggregator Durable Object namespace cleanly.
+[[migrations]]
+tag = "v1-run-aggregator"
+new_sqlite_classes = ["RunAggregator"]
+
+[[migrations]]
+tag = "v2-remove-run-aggregator"
+deleted_classes = ["RunAggregator"]
+
 # ─── Queue 生产者 ─────────────────────────────────────────────────────────────
 [[queues.producers]]
 binding = "PARSE_QUEUE"
