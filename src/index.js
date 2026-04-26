@@ -1,22 +1,66 @@
 'use strict';
 
 /**
- * Lightweight backfill pipeline:
- *   scheduled -> parse-queue-backfill -> parser -> processed-backfill/<run-id>/
- *   -> send-queue-backfill -> sender -> customer endpoint
+ * Cloudflare Workers — Logpush Historical Backfill Worker (queue-only)
  *
- * This keeps the customer-facing requirements only:
- * - precise [BACKFILL_START_TIME, BACKFILL_END_TIME] replay
- * - drop Worker subrequests
- * - transform to partner format
- * - authenticated POST with configurable sender ceiling
+ * 专用于补传指定时间窗 [BACKFILL_START_TIME, BACKFILL_END_TIME] 内的 Logpush 日志。
+ * 与生产 worker (ctyun-logpush) 完全独立：独立 Worker / 独立 queues / 独立
+ * R2 prefix（processed-backfill/）/ 独立 concurrency 配额。共享同一个 R2 bucket
+ * (只读 logs/ 前缀) 和同一个客户接收端（共担下游带宽）。
  *
- * It intentionally removes the hot-path Durable Object aggregation layer and the
- * related finalize/recovery logic. One raw file may therefore end with one
- * underfilled batch, which is operationally cheaper than coordinating every
- * chunk through a single Durable Object.
+ * Architecture:
+ *   scheduled (cron, 1/min) → 扫 R2 logs/YYYYMMDD/ → rate-limited 入 parse-queue-backfill
+ *                                                       ↓
+ *                          Parser: gzip 流式解码 + 逐条按窗口 + ParentRayID 过滤 +
+ *                                  transformEdge 转 partner 格式 + 每 BATCH_SIZE 行
+ *                                  写入 processed-backfill/<run-id>/{batch}.txt
+ *                                                       ↓
+ *                                           send-queue-backfill
+ *                                                       ↓
+ *                          Sender: gzip + MD5 签名 POST + .done 标记 + 清理临时 batch
+ *                                                       ↓
+ *                                            客户接收端（与生产共享）
+ *
+ * Customer constraints (drives the entire design):
+ *   1. Receiver cap ~100,000 lines/s. Sender hard-capped via:
+ *      max_concurrency × (1000 / MIN_SENDER_INVOCATION_MS) × BATCH_SIZE
+ *      = 20 × (1000 / 200) × 1000 = 100,000 lines/s (theoretical ceiling)
+ *   2. Receiver does NOT dedupe. Delivery is at-least-once. .done / .queued
+ *      markers minimize duplicates; residual fetch-abort cases are < 0.001%.
+ *   3. Drop Worker subrequests. Source-side filter:
+ *      ParentRayID === "00" AND WorkerSubrequest !== true.
+ *
+ * Real-world bottleneck (per measured customer ACK ~1017ms avg):
+ *   Sender single-invocation actual cost ~1.15s (200ms floor doesn't kick in
+ *   when ACK > 200ms). True throughput ≈ max_concurrency / 1.15s ≈ 17 batch/s
+ *   ≈ 17K lines/s. Parser is faster (~51 batch/s) and is NOT the bottleneck.
+ *   To raise throughput, raise Sender max_concurrency in wrangler-backfill.toml,
+ *   not Parser. Do not exceed 80 (would impact production worker on same endpoint).
+ *
+ * Design notes:
+ *   - 热路径不使用 Durable Object（旧版有 RunAggregator，已通过 v2 migration 移除）
+ *   - 每个 raw .gz 文件独立解析，最后一个 batch 可能不满 BATCH_SIZE（可接受）
+ *   - 幂等保护：parser 端 head(.queued) + sender 端 head(.done)
+ *   - 数据丢失保护：parser 失败 rollback (delete batchKey + .queued)
+ *
+ * Env Secrets : CTYUN_ENDPOINT, CTYUN_PRIVATE_KEY, CTYUN_URI_EDGE
+ * Env Vars    : BACKFILL_START_TIME, BACKFILL_END_TIME, BACKFILL_ENABLED,
+ *               BACKFILL_RATE, BATCH_SIZE, SEND_TIMEOUT_MS,
+ *               LOG_PREFIX, LOG_LEVEL, PARSE_QUEUE_NAME, SEND_QUEUE_NAME,
+ *               R2_BUCKET_NAME
+ *
+ * HTTP Endpoints:
+ *   GET  /backfill/status            人话版进度 (Beijing time)
+ *   GET  /backfill/status?view=raw   原始 state + artifact 统计
+ *
+ * Related:
+ *   Production worker: https://github.com/CFChinaNetwork/ctyun-logpush-worker
+ *   Docs (EN/中):      https://cfchinanetwork.github.io/ctyun-logpush-backfill/
  */
 
+// ─── IATA airport code → ISO country code（用于 partner 格式 #45 country 字段）
+//     coloToCountry() 优先用 EdgeColoCode 查表，失败则回退到 ClientCountry，
+//     再失败则默认 'CN'。覆盖 200+ 主流 colo，未列出的 colo 走 fallback。
 const IATA_TO_COUNTRY = Object.freeze({
   'HGH':'CN','SHA':'CN','PEK':'CN','PVG':'CN','CAN':'CN','SZX':'CN',
   'CTU':'CN','CKG':'CN','XIY':'CN','WUH':'CN','NKG':'CN','TSN':'CN',
@@ -91,41 +135,56 @@ function coloToCountry(coloCode, clientCountry) {
   return clientCountry ? clientCountry.toUpperCase() : 'CN';
 }
 
-const SEP = '\u0001';
+// ─── Partner log format constants (CDN partner spec v3.0, 145 fields, SOH-delimited)
+const SEP = '\u0001';                 // SOH (0x01) field separator per partner spec
 const MONTH_ABBR = Object.freeze([
   'Jan','Feb','Mar','Apr','May','Jun',
   'Jul','Aug','Sep','Oct','Nov','Dec',
 ]);
-const VERSION_EDGE = 'cf_vod_v3.0';
+const VERSION_EDGE = 'cf_vod_v3.0';   // partner spec version tag (field #1)
+// Pre-frozen "all dashes" arrays for unused trailing fields (cheap to spread)
 const DASHES_9  = Object.freeze(Array(9).fill('-'));
 const DASHES_4  = Object.freeze(Array(4).fill('-'));
 const DASHES_2  = Object.freeze(Array(2).fill('-'));
 const DASHES_16 = Object.freeze(Array(16).fill('-'));
 const DASHES_15 = Object.freeze(Array(15).fill('-'));
 const DASHES_50 = Object.freeze(Array(50).fill('-'));
+// Field-level truncation limits (matches production worker)
 const MAX_URL_LEN = 4096;
 const MAX_UA_LEN  = 1024;
 const MAX_REF_LEN = 2048;
 
-const BATCH_ROOT_PREFIX       = 'processed-backfill/';
-const STATE_KEY               = 'backfill-state/progress.json';
-const STATUS_KEY              = 'backfill-state/status.json';
-const MAX_RANGE_HOURS         = 24 * 7;
-const WALL_TIME_BUDGET_MS     = 55_000;
-const CLEANUP_GRACE_MS        = 24 * 60 * 60_000;
-const MAX_RATE                = 100;
-const DEFAULT_RATE            = 5;
-const LIST_LIMIT              = 1000;
-const MAX_DAY_PREFIXES        = 10;
-const DEFAULT_SEND_TIMEOUT_MS = 300_000;
+// ─── Runtime constants
+const BATCH_ROOT_PREFIX       = 'processed-backfill/';     // 所有 batch artifact 写在这个前缀下
+const STATE_KEY               = 'backfill-state/progress.json'; // 内部 progress state
+const STATUS_KEY              = 'backfill-state/status.json';   // 对外人话版 status
+const MAX_RANGE_HOURS         = 24 * 7;                    // 最大 7 天回放窗口
+const WALL_TIME_BUDGET_MS     = 55_000;                    // 单次 cron 不超过 55s（cron 周期 60s）
+const CLEANUP_GRACE_MS        = 24 * 60 * 60_000;          // delivery_completed 后等 24h 才删 artifact
+const MAX_RATE                = 100;                       // BACKFILL_RATE 上限（files/cron-min）
+const DEFAULT_RATE            = 5;                         // BACKFILL_RATE 默认值（保守）
+const LIST_LIMIT              = 1000;                      // R2 list 单页 size
+const MAX_DAY_PREFIXES        = 10;                        // 防止跨日 prefix 失控
+const DEFAULT_SEND_TIMEOUT_MS = 300_000;                   // 5 min — 故意宽松，最小化 abort 引起的翻倍
 const MIN_SEND_TIMEOUT_MS     = 1_000;
-const DEFAULT_BATCH_SIZE      = 1000;
+const DEFAULT_BATCH_SIZE      = 1000;                      // 每次 POST 1000 行
 const LOG_LEVELS             = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
 
-// One invocation sends at most one POST and lasts at least 200ms.
-// lines/s ceiling = max_concurrency * max_batch_size * (1000 / 200) * BATCH_SIZE
+// ─── Sender 限速：单 invocation 至少 200ms（设计来防止 ACK 极快时超过 receiver cap）
+//
+// 理论 ceiling = max_concurrency × max_batch_size × (1000 / 200) × BATCH_SIZE
+//              = 20 × 1 × 5 × 1000 = 100,000 lines/s
+//
+// 注意 (基于实测)：客户接收端 ACK 平均 1017ms，floor 在 ACK>200ms 时不起作用。
+// 实际单 invocation 耗时由 ACK 决定 (~1.15s)，真实吞吐 ≈ 20/1.15 = 17 batch/s。
+// 要提高吞吐，调 wrangler-backfill.toml 里 send-queue 的 max_concurrency
+// （而不是改 floor 值）。详见顶部 banner 的 "Real-world bottleneck" 段落。
 const MIN_SENDER_INVOCATION_MS = 200;
 
+// ─── Worker 入口 ────────────────────────────────────────────────────────────
+// queue:     被 parse-queue-backfill / send-queue-backfill 触发，按 queue 名分发
+// scheduled: cron 每分钟一次，runBackfillScan 负责 enqueue + cleanup
+// fetch:     HTTP 入口，主要处理 GET /backfill/status
 export default {
   async queue(batch, env) {
     if (batch.queue === env.PARSE_QUEUE_NAME) await handleParseQueue(batch, env);
@@ -134,6 +193,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    // ctx.waitUntil 让 cron 在 background 跑，不阻塞 scheduled handler 返回
     ctx.waitUntil(runBackfillScan(env));
   },
 
@@ -142,10 +202,32 @@ export default {
   },
 };
 
+// ─── Parser ─────────────────────────────────────────────────────────────────
+// 消费 parse-queue-backfill：每 message 是一个 R2 raw .gz 文件 key。
+// 流式解压 ndjson → 逐条按时间窗口和 ParentRayID 过滤 → transformEdge 转格式 →
+// 每 BATCH_SIZE (1000) 行写一个 batch 文件到 processed-backfill/<run-id>/ 并入
+// send-queue-backfill。
+//
+// max_batch_size = 1（wrangler-backfill.toml 配置）：单 invocation 处理一个文件，
+// 避免大 raw .gz 文件之间共享 CPU 预算。
+//
+// 实际单文件 wall time（基于实测 100K 行 / 26MB gz / 50.9% 命中率）：
+//   - JSON.parse + filter + transform：~3-4s CPU
+//   - 51 × writeBatchAndEnqueue × 5 串行 R2 ops × 22ms：~5.6s I/O
+//   - 总 ~9-10s/file → 60 file/min 单 consumer → 600 file/min 总（max_concurrency=10）
 async function handleParseQueue(batch, env) {
+  // max_batch_size=1，所以 messages 数组实际只有 1 条；用 allSettled 是防御性的
   await Promise.allSettled(batch.messages.map((msg) => processFile(msg, env)));
 }
 
+// 单个 raw 文件处理：
+//   1. 验证 run 元数据 + 跳过已 cleaned 的 run（防止 late retry 重新处理）
+//   2. R2.get 流式拉取 .gz
+//   3. streamParseNdjsonGzip 逐行回调（边解压边解析，避免 OOM）
+//   4. 三层过滤：timestamp 窗口 → ParentRayID/WorkerSubrequest → transform 异常
+//   5. 累计到 BATCH_SIZE 行就 flush 一个 batch 到 R2 + send-queue
+//   6. 文件末尾把不满 BATCH_SIZE 的 tail batch 也 flush（这就是为什么
+//      一个 raw 文件可能有 1 个 underfilled batch）
 async function processFile(msg, env) {
   const key = msg.body?.object?.key;
   if (!key) {
@@ -225,16 +307,31 @@ async function processFile(msg, env) {
   }
 }
 
+// 写一个 batch 到 R2 并入 send-queue。
+//
+// 幂等保护（关键）：
+//   - head(.done)   命中：上次 sender 已发送，跳过避免重复发到客户
+//   - head(.queued) 命中：上次 parser retry 已入过队，跳过避免重复入队
+//
+// 失败回滚（关键）：
+//   - 任何一步失败（put batch/put queued/send queue）都 delete batch+queued
+//   - 不能留孤立 batchKey 或 .queued（否则 cleanup 阶段会误判）
+//
+// 5 个串行 await 是 Parser 单文件 wall time 的主要来源（占 ~70%）。
+// 历史上讨论过用 Promise.all 并行化，但因 race condition 风险（一边 put
+// 一边 catch+delete 可能产生孤立资源 → 数据丢失）暂未实施。
 async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
   const batchKey = buildBatchKey(sourceKey, index, run.id, lines.length);
   const queuedMarkerKey = `${batchKey}.queued`;
 
+  // 幂等检查 1：本 batch 是否已被 sender 成功发送
   const doneMarker = await env.RAW_BUCKET.head(`${batchKey}.done`).catch(() => null);
   if (doneMarker) {
     log(env, 'debug', `Batch already sent (skip): ${batchKey}`);
     return;
   }
 
+  // 幂等检查 2：本 batch 是否已被 parser 入过 send-queue（防 parser retry 翻倍）
   const queuedMarker = await env.RAW_BUCKET.head(queuedMarkerKey).catch(() => null);
   if (queuedMarker) {
     log(env, 'debug', `Batch already queued (skip duplicate enqueue): ${batchKey}`);
@@ -243,12 +340,15 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
 
   const body = `${lines.join('\n')}\n`;
   try {
+    // Step 1：写 batch 内容（sender 后续 R2.get 用）
     await env.RAW_BUCKET.put(batchKey, body, {
       httpMetadata: { contentType: 'text/plain; charset=utf-8' },
     });
+    // Step 2：写 .queued 标记（parser retry 时跳过本 batch 用）
     await env.RAW_BUCKET.put(queuedMarkerKey, '1', {
       httpMetadata: { contentType: 'text/plain' },
     });
+    // Step 3：入 send-queue（sender 异步消费）
     await env.SEND_QUEUE.send({
       key: batchKey,
       queuedAtMs: Date.now(),
@@ -256,6 +356,7 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
       lineCount: lines.length,
     });
   } catch (error) {
+    // 任何一步失败都 rollback，避免留孤立资源
     await Promise.allSettled([
       env.RAW_BUCKET.delete(batchKey),
       env.RAW_BUCKET.delete(queuedMarkerKey),
@@ -266,10 +367,25 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
   log(env, 'debug', `Queued: ${batchKey} (${lines.length} lines)`);
 }
 
+// ─── Sender ─────────────────────────────────────────────────────────────────
+// 消费 send-queue-backfill：每 message 是一个待发送的 batch R2 key。
+// R2.get → gzip → MD5 签名 POST → 客户 ACK → 写 .done → delete batch + .queued。
+//
+// max_batch_size = 1, max_concurrency = 20（wrangler-backfill.toml）。
+//
+// 真实瓶颈（基于 vivo 客户实测 ack_ms_avg=1017ms）：
+//   单 invocation 实际耗时 ≈ 1.15s（ACK 1s + R2 ops ~150ms）
+//   总吞吐 = 20 / 1.15 ≈ 17 batch/s ≈ 17K lines/s
+//
+// 提升吞吐唯一安全方法：在 wrangler-backfill.toml 把 max_concurrency 从 20 渐进
+// 调到 30 → 50（不要超过 80，会冲击客户接收端 + 影响生产 worker）。
+// 不要调 MIN_SENDER_INVOCATION_MS 或 max_batch_size。
 async function handleSendQueue(batch, env) {
   const invocationStart = Date.now();
+  // max_batch_size=1，所以 messages 只有 1 条；用 allSettled 是防御性的
   const results = await Promise.allSettled(batch.messages.map((msg) => sendBatch(msg, env)));
 
+  // 单条失败不影响其他：成功 ack，失败 retry（CF queue at-least-once 语义）
   results.forEach((result, index) => {
     if (result.status === 'fulfilled') batch.messages[index].ack();
     else {
@@ -278,12 +394,27 @@ async function handleSendQueue(batch, env) {
     }
   });
 
+  // 200ms 限速 floor：保护客户接收端在 ACK 极快情况下也不会被 burst 打爆。
+  // 注意：客户实测 ACK ~1s，floor 在生产环境实际不起作用（已经 >> 200ms）。
   const elapsed = Date.now() - invocationStart;
   if (elapsed < MIN_SENDER_INVOCATION_MS) {
     await new Promise((resolve) => setTimeout(resolve, MIN_SENDER_INVOCATION_MS - elapsed));
   }
 }
 
+// 单 batch 发送热路径。完成顺序对幂等性至关重要：
+//   1. head(.done) 早返回 — 防 queue 重复投递时翻倍
+//   2. R2.get 取 batch 内容（如果文件已被 cleanup 删了且 run 已 cleaned，静默 ack）
+//   3. CompressionStream gzip 边读边压缩（不一次性加载到内存）
+//   4. fetch POST + AbortController 5min timeout（默认值刻意宽松，最小化
+//      abort 触发概率 → 因为客户接收端不能 dedupe，abort 会引起翻倍）
+//   5. resp.body.cancel() 显式释放 — 防 CF "stalled HTTP response" 保护
+//   6. 写 .done 标记（3 次重试，关键步骤）
+//   7. delete batchKey + .queued（用 catch+warn 不抛异常 — delete 失败不能让
+//      已成功的 batch 重发）
+//
+// 如果 .done 写失败：throw → msg.retry() → 下次 retry 时 head(.done)=null →
+// 重新 fetch → 客户可能收到第 2 份（< 0.0001% 概率，已 3 次内部重试覆盖）。
 async function sendBatch(msg, env) {
   const { key } = msg.body;
   if (!key) throw new Error(`Invalid message: ${JSON.stringify(msg.body)}`);
@@ -376,6 +507,13 @@ async function sendBatch(msg, env) {
   }
 }
 
+// ─── Cron / Scheduled Handler ───────────────────────────────────────────────
+// 每分钟一次。两个职责：
+//   (a) phase=enqueue 阶段：扫 R2 logs/YYYYMMDD/ 把窗口内文件入 parse-queue
+//   (b) status=done 阶段：跑 cleanup 状态机（inspect → ready → 24h grace → delete）
+//
+// 单次 cron 不超过 WALL_TIME_BUDGET_MS = 55s（cron 周期 60s）。
+// 跨 cron 用 R2 上的 backfill-state/progress.json 持久化进度，中断不丢数据。
 async function runBackfillScan(env) {
   const startedAt = Date.now();
   try {
@@ -415,6 +553,8 @@ async function runBackfillScan(env) {
   }
 }
 
+// 校验环境变量并构造 cron config。所有错误都进 log，cron 跳过本次执行。
+// 关键约束：END 必须 ≤ 当前时间；窗口跨度 ≤ MAX_RANGE_HOURS (7 天)。
 function parseConfig(env) {
   const start = (env.BACKFILL_START_TIME || '').trim();
   const end = (env.BACKFILL_END_TIME || '').trim();
@@ -461,6 +601,11 @@ function parseConfig(env) {
   };
 }
 
+// 从 R2 读 progress.json，三种情况：
+//   (a) 同一 config (start/end 都未变)：继续这个 run
+//   (b) config 变了 + 旧 run 已 cleaned：reinitialize 一个新 run
+//   (c) config 变了 + 旧 run 还在跑：抛错（防止用户 race condition 重写 state）
+// (c) 的处理方式：要重跑同一时间窗，必须先手动删 progress.json + status.json。
 async function loadState(env, config) {
   const obj = await env.RAW_BUCKET.get(STATE_KEY).catch(() => null);
   if (obj) {
@@ -504,6 +649,18 @@ async function saveState(env, state) {
   });
 }
 
+// Enqueue Phase：扫 R2 logs/YYYYMMDD/ 把窗口内文件入 parse-queue。
+//
+// 双层时间过滤（保险）：
+//   (1) prefix 级别：getR2PrefixesByDay 限定到具体日期前缀，缩小 list 范围
+//   (2) 文件名级别：extractFileTimeRange 解析 startMs/endMs，跳过窗口外文件
+//   (3) 记录级别：Parser 端再按 EdgeStartTimestamp 精确裁切（不在这里做）
+//
+// rate-limited：每次 cron 最多入队 BACKFILL_RATE 个文件，防止 parse-queue 瞬时爆量。
+// 增量保存：用 prog.start_after 记录扫到哪了，下次 cron 直接续上。
+//
+// 跳过特殊 key：BATCH_ROOT_PREFIX (本工具产物)、backfill-state/、生产 worker 的
+// .recover-done- 标记 / processed/ 前缀（避免误把它们当作 raw 文件处理）。
 async function runEnqueue(env, state, config, startedAt) {
   const prefixes = getR2PrefixesByDay(config.startMs, config.endMs, config.logPrefix);
   for (const prefix of prefixes) {
@@ -588,9 +745,19 @@ async function runEnqueue(env, state, config, startedAt) {
   return true;
 }
 
+// ─── Cleanup State Machine ──────────────────────────────────────────────────
+// 在 enqueue 完成后，按以下状态机清理 processed-backfill/<run-id>/ 临时文件：
+//
+//   pending  → inspectRunArtifacts: 列所有 artifact 并验证 .done 都存在
+//   ready    → 24h grace period 等待运维方检查
+//   deleting → deleteRunArtifacts: 批量删除所有 artifact
+//   done     → 标记 state.status='cleaned'，run 彻底完成
+//
+// 任何阶段都遵守 WALL_TIME_BUDGET_MS，超时则把进度持久化等下次 cron 续。
 async function maybeAutoCleanup(env, state, startedAt) {
   state.cleanup = normalizeCleanupState(state.cleanup);
 
+  // done → 把外层 state.status 也升级为 cleaned（双向同步）
   if (state.cleanup.status === 'done') {
     if (state.status !== 'cleaned') {
       state.status = 'cleaned';
@@ -599,6 +766,7 @@ async function maybeAutoCleanup(env, state, startedAt) {
     return false;
   }
 
+  // ready → 等 24h grace 后才进入 deleting
   if (state.cleanup.status === 'ready') {
     const readyAt = Date.parse(state.cleanup.ready_at || '');
     if (Number.isFinite(readyAt) && Date.now() - readyAt < CLEANUP_GRACE_MS) return false;
@@ -611,9 +779,13 @@ async function maybeAutoCleanup(env, state, startedAt) {
     return deleteRunArtifacts(env, state, startedAt);
   }
 
+  // 默认 (pending) → 走 inspect
   return inspectRunArtifacts(env, state, startedAt);
 }
 
+// inspect 阶段：list processed-backfill/<run-id>/ 所有对象，验证每个 .txt 都
+// 有对应 .done 标记。如果发现还有 pending 的 batch（.txt 但没 .done），重置
+// cleanup state 让 sender 继续发送。增量保存 inspect_start_after 支持续跑。
 async function inspectRunArtifacts(env, state, startedAt) {
   const prefix = getBatchPrefix(state.run_id);
   let changed = false;
@@ -654,6 +826,8 @@ async function inspectRunArtifacts(env, state, startedAt) {
   return changed;
 }
 
+// delete 阶段：批量删除 processed-backfill/<run-id>/ 下所有对象。
+// R2 batch delete API 一次最多 1000 个 key（LIST_LIMIT）。整批失败时降级到逐个删除。
 async function deleteRunArtifacts(env, state, startedAt) {
   const prefix = getBatchPrefix(state.run_id);
   let changed = false;
@@ -682,6 +856,8 @@ async function deleteRunArtifacts(env, state, startedAt) {
   return changed;
 }
 
+// 优先用 batch delete (一次 API call 删多个)，失败则降级为单个并行 delete。
+// 单个 delete 的失败用 allSettled 吞掉（cleanup 阶段允许部分失败，下次 cron 继续）。
 async function deleteR2Keys(env, keys) {
   if (keys.length === 0) return;
   try {
@@ -691,6 +867,14 @@ async function deleteR2Keys(env, keys) {
   }
 }
 
+// ─── HTTP Endpoints ─────────────────────────────────────────────────────────
+// GET  /                       — banner 文本，纯 placeholder
+// GET  /backfill/status        — 人话版 status JSON（buildPublicStatusResponse）
+// GET  /backfill/status?view=raw — 原始 progress.json + artifact 统计
+//
+// /backfill/status 同时把 payload 写到 R2 backfill-state/status.json，方便在
+// R2 UI 直接看（不需要每次 curl）。这个写入是只在 GET /backfill/status 触发，
+// 不是高频热路径。
 async function handleFetch(request, env) {
   const url = new URL(request.url);
 
@@ -746,6 +930,12 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
+// ─── 流式解析: gzip + ndjson → 逐行 JSON 回调 ──────────────────────────────
+// 关键点：
+//   - DecompressionStream 边读边解压（不一次性加载到内存，128MB 安全）
+//   - TextDecoder { stream: true } 处理跨 chunk 的 UTF-8 字节边界
+//   - buffer.split('\n') + buffer = lines.pop() ?? '' 是经典的"保留最后一行"
+//     语义（最后一行可能不完整，留给下个 chunk 拼接）
 async function streamParseNdjsonGzip(inputStream, onRecord) {
   const reader = inputStream.pipeThrough(new DecompressionStream('gzip')).getReader();
   const decoder = new TextDecoder('utf-8');
@@ -779,12 +969,19 @@ async function tryParse(line, onRecord) {
   }
 }
 
+// ─── 格式转换: CF http_requests → CDN partner format v3.0（145 字段, SOH 分隔）─
+// 字段顺序严格按 partner spec 排列。空值/缺失统一输出 '-'，避免空字段被误解析。
+// 长字段（URL/UA/Referer）按 partner 限制截断。
+//
+// sf = "string field"：null/empty → '-'；其余按 maxLen 截断
 function sf(val, maxLen) {
   if (val == null || val === '') return '-';
   const s = String(val);
   return maxLen && s.length > maxLen ? s.substring(0, maxLen) : s;
 }
 
+// 单条记录转换：返回 SOH 分隔的字符串。字段顺序就是 partner spec 字段索引。
+// DASHES_N 是预冻结的纯 '-' 数组（性能：避免每条记录都 new Array+fill）。
 function transformEdge(r) {
   return [
     VERSION_EDGE,
@@ -855,6 +1052,7 @@ function responseContentLength(r) {
   return '-';
 }
 
+// CF CacheCacheStatus → partner HIT/MISS 二元映射（partner 不区分细分状态）
 function mapCache(s) {
   if (!s) return '-';
   const l = s.toLowerCase();
@@ -863,18 +1061,26 @@ function mapCache(s) {
   return '-';
 }
 
+// CF CacheCacheStatus → partner static/dynamic 标记（用于动静分离统计）
 function mapDysta(s) {
   if (!s) return '-';
   const l = s.toLowerCase();
   return l === 'hit' ? 'static' : l === 'dynamic' ? 'dynamic' : '-';
 }
 
+// ─── 鉴权: auth_key={ts}-{rand}-md5({uri}-{ts}-{rand}-{key}) ────────────────
+// 协议要求：ts 为未来时间（now + 300s 留 buffer 容忍时钟偏差），rand 为随机数。
+// 接收端用同样的 privateKey 重新计算 md5 验证签名。
 function buildAuthUrl(endpoint, uri, privateKey) {
   const ts = Math.floor(Date.now() / 1000) + 300;
   const rand = Math.floor(Math.random() * 99999);
   return `${endpoint}${uri}?auth_key=${ts}-${rand}-${md5(`${uri}-${ts}-${rand}-${privateKey}`)}`;
 }
 
+// ─── Time / Format helpers ─────────────────────────────────────────────────
+
+// Logpush EdgeStartTimestamp 可能是数字（秒/毫秒）或字符串（数字/ISO 日期），
+// 这里统一返回 ms epoch（>1e12 视为已是 ms，否则视为秒 × 1000）
 function parseTimestamp(ts) {
   if (ts == null) return null;
   if (typeof ts === 'number') return ts > 1e12 ? ts : ts * 1000;
@@ -887,6 +1093,7 @@ function parseTimestamp(ts) {
   return null;
 }
 
+// Apache log format 时间："[DD/Mon/YYYY:HH:MM:SS +0800]"（partner 强制北京时间）
 function fmtTimeLocal(ts) {
   const ms = parseTimestamp(ts);
   if (ms == null) return '-';
@@ -925,6 +1132,15 @@ function schemeToPort(scheme) {
   return scheme.toLowerCase() === 'https' ? '443' : '80';
 }
 
+// ─── 时间范围提取（用于 enqueue 阶段过滤窗口外文件）────────────────────────
+// Logpush R2 文件名两种格式：
+//   双时间戳（默认）: 20260422T140000Z_20260422T140500Z_abc.log.gz
+//   单时间戳（fallback）: 20260422T140000Z_abc.log.gz
+//
+// runEnqueue 用此函数判断"文件时间范围与 [A,B] 窗口是否有交集"：
+//   - file.startMs > B → 跳过（已过窗口；list 顺序保证后面也都过窗口，可以 break）
+//   - file.endMs < A   → 跳过（在窗口前）
+//   - 其余 → 加入 parse-queue（Parser 端再按记录 EdgeStartTimestamp 精确裁切）
 function extractFileTimeRange(key) {
   const m = key.match(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z[_-](\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/);
   if (m) {
@@ -940,10 +1156,13 @@ function extractFileTimeRange(key) {
   return null;
 }
 
+// 记录级（Parser 端）的窗口判断：用 EdgeStartTimestamp 精确裁切。
 function isRecordInRunWindow(recordMs, run) {
   return recordMs >= run.startMs && recordMs <= run.endMs;
 }
 
+// 解析 parse-queue 消息中的 run 元数据。如果消息里没带或字段缺失，回退到读
+// R2 progress.json 取当前 run_id（兼容旧版本入队的 message 缺字段的情况）。
 async function resolveRunContext(run, env) {
   const normalized = normalizeRunContext(run);
   if (normalized.valid) return normalized;
@@ -989,6 +1208,11 @@ function normalizeRunContext(run) {
   };
 }
 
+// ─── Run ID helpers ─────────────────────────────────────────────────────────
+// run_id 格式：{startUTC}_{endUTC}_{createdAtUTC}，例如：
+//   20260422T070500Z_20260422T084000Z_20260425T050927Z
+// 同一时间窗口的不同 run（删了 state 重跑）会有不同的 createdAt 后缀，所以
+// 旧 run 的 processed-backfill/<run-id>/ 不会与新 run 冲突。
 function buildRunId(startMs, endMs) {
   return `${fmtCompactUtc(startMs)}_${fmtCompactUtc(endMs)}`;
 }
@@ -1008,6 +1232,11 @@ function fmtCompactUtc(ms) {
   return `${yyyy}${mm}${dd}T${hh}${mi}${ss}Z`;
 }
 
+// batchKey 格式：processed-backfill/<run-id>/<safeTail>-<md5>-<idx>-n<lineCount>.txt
+//   - safeTail：source 文件名安全化（只留 [a-zA-Z0-9_-]，截断 80 字符）
+//   - md5(sourceKey)：避免不同源文件 safeTail 撞名
+//   - idx：同一 sourceKey 内的 batch 序号
+//   - n<lineCount>：batch 实际行数（用于 collectRunArtifactStats 统计）
 function buildBatchKey(sourceKey, index, runId, lineCount = 0) {
   const tail = sourceKey.split('/').pop() || 'raw';
   const safeTail = tail.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
@@ -1070,6 +1299,11 @@ function parsePositiveInt(raw, fallback, min) {
   return parsed;
 }
 
+// 客户业务约束：只发送顶层请求（不发 Worker 子请求 / fetch subrequest 日志）。
+// 两个判据同时成立才保留：
+//   - ParentRayID === "00"：表示这是一个父请求（无 parent ray）
+//   - WorkerSubrequest !== true：未被显式标记为 subrequest
+// 注意 WorkerSubrequest 可能是 boolean 或 string，所以做两次比较。
 function isTopLevelParentRequest(record) {
   return String(record?.ParentRayID ?? '') === '00' && record?.WorkerSubrequest !== true && record?.WorkerSubrequest !== 'true';
 }
@@ -1100,6 +1334,11 @@ function isPendingRunArtifact(key) {
   return key.endsWith('.txt') || key.endsWith('.queued');
 }
 
+// inspect 阶段判断单个 artifact 是否还 pending（用 head(.done) 验证）：
+//   - .queued 文件：对应的 .done 不存在 → pending（sender 还没成功发送）
+//   - .txt 文件：对应的 .done 不存在 → pending
+//   - 其他扩展名：不是 batch artifact，跳过
+// 任何一个 pending 都会让 cleanup 退回 pending 状态等 sender 完成。
 async function isPendingCleanupArtifact(env, key) {
   if (key.endsWith('.queued')) {
     const batchKey = key.slice(0, -'.queued'.length);
@@ -1163,6 +1402,9 @@ async function isRunCleaned(env, runId) {
   }
 }
 
+// 按日期生成 R2 prefix（限定 list 扫描范围，避免扫整个 bucket）。
+// 例如窗口跨 2 天 → 返回 ["logs/20260422/", "logs/20260423/"]。
+// 防爆设计：MAX_DAY_PREFIXES=10 限制最多生成 10 个前缀，超出窗口直接放弃。
 function getR2PrefixesByDay(startMs, endMs, basePrefix) {
   const prefixes = [];
   const d = new Date(startMs);
@@ -1180,6 +1422,8 @@ function getR2PrefixesByDay(startMs, endMs, basePrefix) {
   return prefixes;
 }
 
+// 统一日志函数。LOG_LEVEL=info 时丢弃 debug；error/warn 走 console.error/warn 便于
+// 在 wrangler tail 里区分级别。前缀 [BACKFILL][LEVEL] 便于 grep。
 function log(env, level, msg) {
   if ((LOG_LEVELS[level] ?? 1) >= (LOG_LEVELS[env?.LOG_LEVEL] ?? 1)) {
     const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
@@ -1193,6 +1437,11 @@ function parseQueueWaitMs(queuedAtMs) {
   return Math.max(0, Date.now() - queuedAt);
 }
 
+// 扫 processed-backfill/<run-id>/ 下所有 artifact，按 batch 分组（baseKey 是
+// .txt 不带后缀），返回总 batch 数 / 已发数（有 .done）/ 待发数 / 行数分布。
+//
+// 仅在 GET /backfill/status 时调用，不是热路径。大 run（>10K batches）时这个
+// 接口可能慢几秒（要 list 全部对象）；不影响 cron 主流程。
 async function collectRunArtifactStats(env, runId, batchSize) {
   if (!runId) return createEmptyArtifactStats(batchSize);
 
@@ -1317,6 +1566,12 @@ function toBeijingTime(value) {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} GMT+8`;
 }
 
+// 把内部 progress.json 转成对外友好的 status payload。增加了：
+//   - summary：一句人话总结
+//   - delivery_completed / fully_completed 双口径（前者是 batch 都发完，后者是含
+//     cleanup grace 也彻底完成）
+//   - 北京时间字段（避免运维方误读 UTC）
+//   - explained 字段（每个状态码都附人话解释）
 function buildPublicStatusResponse(state, artifactStats, env) {
   const stage = derivePublicStage(state, artifactStats);
   const lastUpdatedAt = state.updated_at || state.last_cron_at || state.completed_at || state.started_at || null;
@@ -1406,6 +1661,10 @@ function buildBatchSizeNote(artifactStats) {
   return `这次 batch 明显不是固定 ${maxConfigured} 条。平均只有 ${avg} 条，说明这个时间窗里的日志比较分散，按文件切出来的 batch 普遍偏小。`;
 }
 
+// 写 .done 标记，3 次重试 + 指数退避 (100ms / 200ms / 300ms)。
+// .done 是 sender 的核心幂等保证：一旦写入，重试时 head(.done) 命中直接 skip 不重发。
+// 3 次都失败则返回 false，调用方会 throw → msg.retry()，下次 retry 时仍 fetch 一次
+// （这就是 < 0.0001% 的"残留翻倍"场景）。
 async function writeDoneMarkerWithRetry(env, key) {
   const markerKey = `${key}.done`;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1425,6 +1684,8 @@ async function writeDoneMarkerWithRetry(env, key) {
   return false;
 }
 
+// ─── Test surface（仅 vitest/test 用，不参与生产逻辑）────────────────────────
+// 暴露内部纯函数给 test/index.test.js 做白盒测试，避免污染默认 export。
 export const __test = {
   buildHumanMessage,
   buildBatchSizeNote,
@@ -1461,6 +1722,12 @@ export const __test = {
   writeDoneMarkerWithRetry,
 };
 
+// ─── MD5 (RFC 1321) ─────────────────────────────────────────────────────────
+// 用于 buildAuthUrl 计算签名（partner 协议规定）。SubtleCrypto 不支持 MD5，
+// 所以这里用纯 JS 实现。每个 sendBatch 调用一次（输入很短，<1ms）。
+//
+// unescape(encodeURIComponent(...)) 是把 UTF-8 字符串转成字节序列的经典写法
+// （即使 unescape 已 deprecated，在 V8/Workers 仍可用，未来可换 TextEncoder）。
 function md5(str) {
   const add = (x,y)=>{const l=(x&0xffff)+(y&0xffff);return(((x>>16)+(y>>16)+(l>>16))<<16)|(l&0xffff);};
   const rol = (n,c)=>(n<<c)|(n>>>(32-c));
