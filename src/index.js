@@ -109,6 +109,7 @@ const MAX_REF_LEN = 2048;
 
 const BATCH_ROOT_PREFIX       = 'processed-backfill/';
 const STATE_KEY               = 'backfill-state/progress.json';
+const STATUS_KEY              = 'backfill-state/status.json';
 const MAX_RANGE_HOURS         = 24 * 7;
 const WALL_TIME_BUDGET_MS     = 55_000;
 const CLEANUP_GRACE_MS        = 24 * 60 * 60_000;
@@ -408,6 +409,10 @@ async function runBackfillScan(env) {
         log(env, 'warn', `Failed to save state (will retry next cron): ${error.message}`);
       });
     }
+
+    await writePublicStatusSnapshot(env, state).catch((error) => {
+      log(env, 'warn', `Failed to refresh public status snapshot: ${error.message}`);
+    });
   } catch (error) {
     log(env, 'error', `Backfill cron crashed: ${error.message}\n${error.stack}`);
   }
@@ -695,7 +700,7 @@ async function handleFetch(request, env) {
   if (url.pathname === '/backfill/status') {
     const obj = await env.RAW_BUCKET.get(STATE_KEY).catch(() => null);
     if (!obj) {
-      return jsonResponse({
+      const notStarted = {
         status: 'not_started',
         message: 'No backfill state found yet. Ensure BACKFILL_START_TIME and BACKFILL_END_TIME are set and wait for the next cron trigger.',
         config_hint: {
@@ -704,7 +709,11 @@ async function handleFetch(request, env) {
           BACKFILL_RATE: env.BACKFILL_RATE || String(DEFAULT_RATE),
           BACKFILL_ENABLED: env.BACKFILL_ENABLED || '(default: false)',
         },
-      });
+      };
+      await env.RAW_BUCKET.put(STATUS_KEY, JSON.stringify(notStarted, null, 2), {
+        httpMetadata: { contentType: 'application/json; charset=utf-8' },
+      }).catch(() => {});
+      return jsonResponse(notStarted);
     }
 
     try {
@@ -713,7 +722,11 @@ async function handleFetch(request, env) {
       if (url.searchParams.get('view') === 'raw') {
         return jsonResponse({ ...data, artifact_stats: artifactStats });
       }
-      return jsonResponse(buildPublicStatusResponse(data, artifactStats, env));
+      const publicStatus = buildPublicStatusResponse(data, artifactStats, env);
+      await env.RAW_BUCKET.put(STATUS_KEY, JSON.stringify(publicStatus, null, 2), {
+        httpMetadata: { contentType: 'application/json; charset=utf-8' },
+      }).catch(() => {});
+      return jsonResponse(publicStatus);
     } catch (error) {
       return jsonResponse({ status: 'error', message: `State file corrupted: ${error.message}` }, 500);
     }
@@ -1309,30 +1322,35 @@ function toBeijingTime(value) {
 
 function buildPublicStatusResponse(state, artifactStats, env) {
   const stage = derivePublicStage(state, artifactStats);
-  const checkedAt = new Date().toISOString();
   const lastUpdatedAt = state.updated_at || state.last_cron_at || state.completed_at || state.started_at || null;
+  const isDeliveryCompleted = artifactStats.pending_batches === 0 && ['done', 'cleaned'].includes(state.status);
+  const isFullyCompleted = state.status === 'cleaned' || state.cleanup?.status === 'done';
   return {
-    status: state.status,
-    stage,
-    message: buildHumanMessage(state, artifactStats, stage),
+    summary: buildHumanMessage(state, artifactStats, stage),
+    status_code: state.status,
+    status_explained: explainStatus(state.status),
+    stage_code: stage,
+    stage_explained: explainStage(stage),
+    delivery_completed: isDeliveryCompleted,
+    delivery_completed_explained: isDeliveryCompleted
+      ? '这表示所有待发送 batch 都已经发完，没有 batch pending 了。'
+      : '这表示还有 batch 尚未发完，补传还在进行中。',
+    fully_completed: isFullyCompleted,
+    fully_completed_explained: isFullyCompleted
+      ? '这表示补传已经彻底完成，临时文件也已经清理完。'
+      : '只有 fully_completed=true 才算彻底补传完成。当前如果只是 delivery_completed=true，说明日志已经发完，但临时文件可能还在等待自动清理。',
     run_id: state.run_id,
-    window_start: state.config?.start || null,
-    window_end: state.config?.end || null,
-    started_at: state.started_at || null,
-    started_at_beijing: toBeijingTime(state.started_at),
-    enqueue_completed_at: state.completed_at || null,
-    enqueue_completed_at_beijing: toBeijingTime(state.completed_at),
-    last_updated_at: lastUpdatedAt,
-    last_updated_at_beijing: toBeijingTime(lastUpdatedAt),
-    status_checked_at: checkedAt,
-    status_checked_at_beijing: toBeijingTime(checkedAt),
-    raw_files_matched: state.enqueued_count ?? 0,
-    raw_files_per_minute_limit: state.config?.rate ?? null,
+    replay_window_beijing: `${toBeijingTime(state.config?.start)} ~ ${toBeijingTime(state.config?.end)}`,
+    task_window_start_beijing: toBeijingTime(state.config?.start),
+    task_window_end_beijing: toBeijingTime(state.config?.end),
+    task_started_beijing: toBeijingTime(state.started_at),
+    raw_file_scan_finished_beijing: toBeijingTime(state.completed_at),
+    last_refresh_beijing: toBeijingTime(lastUpdatedAt),
+    matched_raw_files: state.enqueued_count ?? 0,
+    raw_file_scan_rate_limit_per_minute: state.config?.rate ?? null,
     batches_sent: artifactStats.sent_batches,
-    batches_total: artifactStats.total_batches,
     batches_pending: artifactStats.pending_batches,
     log_lines_sent: artifactStats.sent_lines,
-    log_lines_total: artifactStats.total_lines,
     log_lines_pending: artifactStats.pending_lines,
     batch_size_max_configured: artifactStats.configured_batch_size,
     batch_lines_avg: artifactStats.avg_batch_lines,
@@ -1340,9 +1358,32 @@ function buildPublicStatusResponse(state, artifactStats, env) {
     batch_lines_max: artifactStats.max_batch_lines,
     batch_size_note: buildBatchSizeNote(artifactStats),
     cleanup: state.cleanup,
-    rerun_hint: '如果同一时间窗需要重新跑，请先删除 R2 里的 backfill-state/progress.json，再保持 BACKFILL_ENABLED=true 重新部署或等待下一次 cron。旧 run 的 processed-backfill/<run-id>/ 不会影响新 run。',
-    ui_time_note: 'R2 Dashboard 里 progress.json 的 Date Created 不是这次 run 是否最新的判断依据。请以 started_at、last_updated_at 和 status_checked_at 为准。',
+    rerun_same_window_how: '如果同一时间窗需要重新跑，请先删除 R2 里的 backfill-state/progress.json 和 backfill-state/status.json，再保持 BACKFILL_ENABLED=true 重新部署或等待下一次 cron。旧 run 的 processed-backfill/<run-id>/ 不会影响新 run。',
+    r2_console_note: 'R2 Dashboard 里 progress.json 或 status.json 的 Date Created 不是这次 run 是否最新的判断依据。请看 task_started_beijing、raw_file_scan_finished_beijing、last_refresh_beijing。',
   };
+}
+
+async function writePublicStatusSnapshot(env, state) {
+  const artifactStats = await collectRunArtifactStats(env, state.run_id, parsePositiveInt(env.BATCH_SIZE, DEFAULT_BATCH_SIZE, 1));
+  const publicStatus = buildPublicStatusResponse(state, artifactStats, env);
+  await env.RAW_BUCKET.put(STATUS_KEY, JSON.stringify(publicStatus, null, 2), {
+    httpMetadata: { contentType: 'application/json; charset=utf-8' },
+  });
+}
+
+function explainStatus(status) {
+  if (status === 'running') return '还在执行中，尚未全部完成。';
+  if (status === 'done') return '日志已经发完了，但临时文件可能还在等待自动清理。';
+  if (status === 'cleaned') return '补传彻底完成，临时文件也已经清理完。';
+  return '未知状态。';
+}
+
+function explainStage(stage) {
+  if (stage === 'scanning_and_queueing') return '正在扫描 R2 原始文件，并把命中的文件送进 parse queue。';
+  if (stage === 'sending') return '原始文件已经匹配到一部分，当前 send worker 还在继续发送 batch。';
+  if (stage === 'sent_waiting_cleanup') return '所有 batch 都已经发完，当前只是等待自动清理临时文件。';
+  if (stage === 'cleaned') return '临时文件也已经清理完，这次 backfill 已经彻底结束。';
+  return '当前阶段未知。';
 }
 
 function buildBatchSizeNote(artifactStats) {

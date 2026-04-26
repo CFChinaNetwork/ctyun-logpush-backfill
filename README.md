@@ -47,9 +47,9 @@ Deploy manually:
 wrangler deploy --config wrangler-backfill.toml
 ```
 
-Do not change `BACKFILL_START_TIME` / `BACKFILL_END_TIME` while an existing run is still active. Wait until `/backfill/status` reports `status = "cleaned"` first.
+Do not change `BACKFILL_START_TIME` / `BACKFILL_END_TIME` while an existing run is still active. Wait until `/backfill/status` reports `fully_completed = true` first.
 
-If you must replay the same time window again, delete `cdn-logs-raw/backfill-state/progress.json` first, then redeploy (or keep `BACKFILL_ENABLED = "true"` and wait for the next cron tick). Old `processed-backfill/<run-id>/` prefixes do not block a new run because each run uses a fresh `run_id`.
+If you must replay the same time window again, delete `cdn-logs-raw/backfill-state/progress.json` and `cdn-logs-raw/backfill-state/status.json` first, then redeploy (or keep `BACKFILL_ENABLED = "true"` and wait for the next cron tick). Old `processed-backfill/<run-id>/` prefixes do not block a new run because each run uses a fresh `run_id`.
 
 ## Architecture
 
@@ -68,24 +68,26 @@ wrangler tail ctyun-logpush-backfill
 
 Key status fields:
 
-- `status`
-- `stage`
-- `message`
+- `summary`
+- `status_code` / `status_explained`
+- `stage_code` / `stage_explained`
+- `delivery_completed`
+- `fully_completed`
 - `run_id`
-- `window_start` / `window_end`
-- `raw_files_matched`
-- `batches_sent` / `batches_total` / `batches_pending`
-- `log_lines_sent` / `log_lines_total` / `log_lines_pending`
+- `replay_window_beijing`
+- `task_started_beijing`
+- `raw_file_scan_finished_beijing`
+- `last_refresh_beijing`
+- `matched_raw_files`
+- `batches_sent` / `batches_pending`
+- `log_lines_sent` / `log_lines_pending`
 - `batch_lines_avg` / `batch_lines_min` / `batch_lines_max`
 - `batch_size_note`
-- `started_at_beijing`
-- `enqueue_completed_at_beijing`
-- `last_updated_at_beijing`
-- `status_checked_at_beijing`
 - `cleanup`
-- `rerun_hint`
-- `ui_time_note`
+- `rerun_same_window_how`
+- `r2_console_note`
 
+`/backfill/status` is also persisted to `cdn-logs-raw/backfill-state/status.json` for direct viewing in the R2 UI.
 Use `GET /backfill/status?view=raw` when you want the raw state file plus low-level artifact stats.
 
 ## Safety Defaults

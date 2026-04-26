@@ -68,7 +68,7 @@ wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
 wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 
 wrangler deploy --config wrangler-backfill.toml</code></pre>
-  <p>If you need to replay the exact same window again, delete <code>cdn-logs-raw/backfill-state/progress.json</code> first, then redeploy or wait for the next cron tick. Older <code>processed-backfill/&lt;run-id&gt;/</code> prefixes do not block a fresh run.</p>
+  <p>If you need to replay the exact same window again, delete <code>cdn-logs-raw/backfill-state/progress.json</code> and <code>cdn-logs-raw/backfill-state/status.json</code> first, then redeploy or wait for the next cron tick. Older <code>processed-backfill/&lt;run-id&gt;/</code> prefixes do not block a fresh run.</p>
 
   <h2>Tuning</h2>
   <p>Current checked-in sender ceiling:</p>
@@ -95,13 +95,14 @@ theoretical ceiling
 wrangler tail ctyun-logpush-backfill</code></pre>
   <p>The default <code>/backfill/status</code> response is human-friendly and includes:</p>
   <ul>
-    <li>how many raw files matched the window</li>
-    <li>how many batches have already been sent</li>
-    <li>how many log lines have already been sent</li>
-    <li>average/min/max batch size, so you can tell whether batches are mostly full or tail-sized</li>
-    <li>Beijing-time timestamps plus a note explaining that the R2 Dashboard “Date Created” is not the right signal for the latest run state</li>
+    <li><code>summary</code>: a plain-language one-line description</li>
+    <li><code>status_code</code> and <code>stage_code</code>, each with its own explanation field</li>
+    <li><code>delivery_completed</code>: whether all batches have been sent</li>
+    <li><code>fully_completed</code>: whether the replay is truly finished, including cleanup</li>
+    <li>matched raw file count, sent batch count, sent log line count, pending counts, and batch-size distribution</li>
+    <li>Beijing-time timestamps only, plus a note explaining that the R2 Dashboard “Date Created” is not the right signal for the latest run state</li>
   </ul>
-  <p>Use <code>GET /backfill/status?view=raw</code> if you want the raw state document plus low-level artifact stats.</p>
+  <p>The same human-friendly payload is also written to <code>cdn-logs-raw/backfill-state/status.json</code> so you can inspect it directly in the R2 UI. Use <code>GET /backfill/status?view=raw</code> if you want the raw state document plus low-level artifact stats.</p>
 
   <h2>Finished?</h2>
   <p>The safest completion rule is:</p>

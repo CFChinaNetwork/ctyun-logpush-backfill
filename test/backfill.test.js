@@ -297,12 +297,14 @@ test('buildPublicStatusResponse returns a human-friendly reconciliation view', (
     configured_batch_size: 1000,
   }, { BATCH_SIZE: '1000' });
 
-  assert.equal(response.stage, 'sent_waiting_cleanup');
+  assert.equal(response.stage_code, 'sent_waiting_cleanup');
   assert.equal(response.batches_sent, 3);
   assert.equal(response.log_lines_sent, 2129);
   assert.equal(response.batch_lines_max, 1000);
-  assert.match(response.message, /已经发送完成/);
-  assert.match(response.rerun_hint, /progress\.json/);
-  assert.match(response.ui_time_note, /Date Created/);
+  assert.match(response.summary, /已经发送完成/);
+  assert.match(response.rerun_same_window_how, /progress\.json/);
+  assert.match(response.r2_console_note, /Date Created/);
   assert.match(response.batch_size_note, /不是固定 1000 条/);
+  assert.equal(response.fully_completed, false);
+  assert.equal(response.delivery_completed, true);
 });
