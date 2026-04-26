@@ -1338,11 +1338,29 @@ function buildPublicStatusResponse(state, artifactStats, env) {
     batch_lines_avg: artifactStats.avg_batch_lines,
     batch_lines_min: artifactStats.min_batch_lines,
     batch_lines_max: artifactStats.max_batch_lines,
-    batch_size_note: `单个 batch 最多 ${artifactStats.configured_batch_size} 条；多数 batch 会接近上限，最后一个尾 batch 可能更小。`,
+    batch_size_note: buildBatchSizeNote(artifactStats),
     cleanup: state.cleanup,
     rerun_hint: '如果同一时间窗需要重新跑，请先删除 R2 里的 backfill-state/progress.json，再保持 BACKFILL_ENABLED=true 重新部署或等待下一次 cron。旧 run 的 processed-backfill/<run-id>/ 不会影响新 run。',
     ui_time_note: 'R2 Dashboard 里 progress.json 的 Date Created 不是这次 run 是否最新的判断依据。请以 started_at、last_updated_at 和 status_checked_at 为准。',
   };
+}
+
+function buildBatchSizeNote(artifactStats) {
+  const maxConfigured = artifactStats.configured_batch_size;
+  const avg = artifactStats.avg_batch_lines;
+  if (!artifactStats.total_batches) {
+    return `当前还没有产生 batch。单个 batch 的理论上限是 ${maxConfigured} 条。`;
+  }
+  if (avg === null) {
+    return `单个 batch 的理论上限是 ${maxConfigured} 条。`;
+  }
+  if (avg >= maxConfigured * 0.8) {
+    return `这次 batch 大多接近上限 ${maxConfigured} 条，只有最后的尾 batch 可能更小。`;
+  }
+  if (avg >= maxConfigured * 0.3) {
+    return `这次 batch 不是固定 1000 条。平均 ${avg} 条，说明有不少 batch 在未装满时就结束了。`;
+  }
+  return `这次 batch 明显不是固定 ${maxConfigured} 条。平均只有 ${avg} 条，说明这个时间窗里的日志比较分散，按文件切出来的 batch 普遍偏小。`;
 }
 
 async function writeDoneMarkerWithRetry(env, key) {
@@ -1366,6 +1384,7 @@ async function writeDoneMarkerWithRetry(env, key) {
 
 export const __test = {
   buildHumanMessage,
+  buildBatchSizeNote,
   buildBatchKey,
   buildParseQueueMessage,
   buildPublicStatusResponse,

@@ -304,4 +304,5 @@ test('buildPublicStatusResponse returns a human-friendly reconciliation view', (
   assert.match(response.message, /已经发送完成/);
   assert.match(response.rerun_hint, /progress\.json/);
   assert.match(response.ui_time_note, /Date Created/);
+  assert.match(response.batch_size_note, /不是固定 1000 条/);
 });
