@@ -30,12 +30,15 @@
  *   3. Drop Worker subrequests. Source-side filter:
  *      ParentRayID === "00" AND WorkerSubrequest !== true.
  *
- * Real-world bottleneck (per measured customer ACK ~1017ms avg):
- *   Sender single-invocation actual cost ~1.15s (200ms floor doesn't kick in
- *   when ACK > 200ms). True throughput ≈ max_concurrency / 1.15s ≈ 17 batch/s
- *   ≈ 17K lines/s. Parser is faster (~51 batch/s) and is NOT the bottleneck.
- *   To raise throughput, raise Sender max_concurrency in wrangler-backfill.toml,
- *   not Parser. Do not exceed 80 (would impact production worker on same endpoint).
+ * Real-world bottleneck (vivo asia-main-appstore measured run, 651 files):
+ *   Parser single-file wall time ≈ 150 s (50 batches × 5 sequential R2 ops × ~588 ms/op
+ *   = ~147 s I/O + ~3 s CPU). Parser sustained ≈ 3 batch/s at 93% concurrency utilization.
+ *   Sender single-invocation ≈ 0.55 s (incl. ACK ~400 ms); ceiling ≈ 36 batch/s but
+ *   actual ≈ 3 batch/s at 8% utilization (Sender is mostly idle, waiting on Parser).
+ *   Total throughput ≈ 3 batch/s ≈ 3K lines/s, far below the Sender's 100K nameplate.
+ *   To raise throughput, raise PARSER max_concurrency in wrangler-backfill.toml
+ *   (10 → 20 cuts duration ~50%). Do NOT raise Sender max_concurrency — Sender
+ *   already has plenty of headroom; the bottleneck is upstream.
  *
  * Design notes:
  *   - 热路径不使用 Durable Object（旧版有 RunAggregator，已通过 v2 migration 移除）
@@ -175,10 +178,10 @@ const LOG_LEVELS             = Object.freeze({ debug: 0, info: 1, warn: 2, error
 // 理论 ceiling = max_concurrency × max_batch_size × (1000 / 200) × BATCH_SIZE
 //              = 20 × 1 × 5 × 1000 = 100,000 lines/s
 //
-// 注意 (基于实测)：客户接收端 ACK 平均 1017ms，floor 在 ACK>200ms 时不起作用。
-// 实际单 invocation 耗时由 ACK 决定 (~1.15s)，真实吞吐 ≈ 20/1.15 = 17 batch/s。
-// 要提高吞吐，调 wrangler-backfill.toml 里 send-queue 的 max_concurrency
-// （而不是改 floor 值）。详见顶部 banner 的 "Real-world bottleneck" 段落。
+// 注意：基于 vivo asia-main-appstore 实测，客户接收端 ACK 平均 ~400ms，floor 在
+// ACK>200ms 时不起作用。Sender 单 invocation 实际 ~0.55s，理论吞吐 ~36 batch/s，
+// 但实测只跑 ~3 batch/s（Sender 大部分时间 idle，等 Parser 喂数据）。
+// 要提高总吞吐，调 PARSER max_concurrency（不是 Sender），详见顶部 banner。
 const MIN_SENDER_INVOCATION_MS = 200;
 
 // ─── Worker 入口 ────────────────────────────────────────────────────────────
@@ -211,10 +214,14 @@ export default {
 // max_batch_size = 1（wrangler-backfill.toml 配置）：单 invocation 处理一个文件，
 // 避免大 raw .gz 文件之间共享 CPU 预算。
 //
-// 实际单文件 wall time（基于实测 100K 行 / 26MB gz / 50.9% 命中率）：
-//   - JSON.parse + filter + transform：~3-4s CPU
-//   - 51 × writeBatchAndEnqueue × 5 串行 R2 ops × 22ms：~5.6s I/O
-//   - 总 ~9-10s/file → 60 file/min 单 consumer → 600 file/min 总（max_concurrency=10）
+// 实测单文件 wall time（vivo asia-main-appstore 实测，100K 行 / 26MB gz / 50.9% 命中率）：
+//   - JSON.parse + filter + transform：~3 s CPU
+//   - 50 × writeBatchAndEnqueue × 5 串行 R2 ops，平均每 op ~588 ms：~147 s I/O
+//   - 总 ~150 s/file → 0.4 file/min 单 consumer → 4 file/min 总（max_concurrency=10）
+//
+// I/O 慢的根因不是单个 R2 op 本身慢，而是 long-running invocation 内
+// 大量串行 R2 调用的累积开销。详见顶部 banner 的 "Real-world bottleneck"。
+// 这是整个 pipeline 的实际瓶颈（Parser 93% utilization vs Sender 8%）。
 async function handleParseQueue(batch, env) {
   // max_batch_size=1，所以 messages 数组实际只有 1 条；用 allSettled 是防御性的
   await Promise.allSettled(batch.messages.map((msg) => processFile(msg, env)));
@@ -317,7 +324,8 @@ async function processFile(msg, env) {
 //   - 任何一步失败（put batch/put queued/send queue）都 delete batch+queued
 //   - 不能留孤立 batchKey 或 .queued（否则 cleanup 阶段会误判）
 //
-// 5 个串行 await 是 Parser 单文件 wall time 的主要来源（占 ~70%）。
+// 5 个串行 await 是 Parser 单文件 wall time 的主导来源（实测占 >95%：
+// 50 batch × 5 ops × ~588 ms/op ≈ 147 s I/O，CPU 仅 ~3 s）。
 // 历史上讨论过用 Promise.all 并行化，但因 race condition 风险（一边 put
 // 一边 catch+delete 可能产生孤立资源 → 数据丢失）暂未实施。
 async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
@@ -373,12 +381,13 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
 //
 // max_batch_size = 1, max_concurrency = 20（wrangler-backfill.toml）。
 //
-// 真实瓶颈（基于 vivo 客户实测 ack_ms_avg=1017ms）：
-//   单 invocation 实际耗时 ≈ 1.15s（ACK 1s + R2 ops ~150ms）
-//   总吞吐 = 20 / 1.15 ≈ 17 batch/s ≈ 17K lines/s
+// 实测吞吐（vivo asia-main-appstore，27908 batch / ~150 min 跑完）：
+//   单 invocation 实际 ~0.55s（含 ACK 平均 ~400ms + R2 ops ~150ms）
+//   理论吞吐 = 20 / 0.55 ≈ 36 batch/s
+//   但实测仅 ~3 batch/s（utilization 仅 8%）— Sender 大部分时间 idle，等 Parser 喂数据
 //
-// 提升吞吐唯一安全方法：在 wrangler-backfill.toml 把 max_concurrency 从 20 渐进
-// 调到 30 → 50（不要超过 80，会冲击客户接收端 + 影响生产 worker）。
+// 真正的瓶颈在 Parser（参见 handleParseQueue / writeBatchAndEnqueue）。
+// Sender 已经有大量富余，调 Sender max_concurrency 没有意义；要加速请调 Parser。
 // 不要调 MIN_SENDER_INVOCATION_MS 或 max_batch_size。
 async function handleSendQueue(batch, env) {
   const invocationStart = Date.now();

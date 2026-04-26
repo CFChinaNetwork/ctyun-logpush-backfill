@@ -104,31 +104,35 @@ wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 wrangler deploy --config wrangler-backfill.toml</code></pre>
 
   <h2>吞吐与调速</h2>
-  <p>pipeline 有两个独立上限，<strong>取较低者</strong>：</p>
+  <p>pipeline 有两个独立上限，<strong>取较低者</strong>。下面的数字来自一次 vivo 客户实测（651 个 raw 文件、95 分钟回放窗口、27,908 个 batch、~2.5 小时跑完）。</p>
   <table>
-    <tr><th>阶段</th><th>配置</th><th>理论上限</th></tr>
-    <tr><td>Sender</td><td><code>max_concurrency=20</code> &times; 200ms floor &times; 1000 行/batch</td><td><strong>100,000 行/秒</strong></td></tr>
-    <tr><td>Parser</td><td><code>max_concurrency=10</code> &times; 单 10 万行文件约 15 秒 wall time &times; 100 batch/文件</td><td><strong>~65,000 行/秒</strong></td></tr>
+    <tr><th>阶段</th><th>配置</th><th>理论上限</th><th>实测吞吐</th></tr>
+    <tr><td>Sender</td><td><code>max_concurrency=20</code> &times; 单 invocation ~0.55s（含 ACK ~400ms）</td><td>~36 batch/s</td><td>~3 batch/s（利用率 8% &mdash; 大部分时间 idle）</td></tr>
+    <tr><td>Parser</td><td><code>max_concurrency=10</code> &times; 10 万行单文件 ~150 秒 wall time &times; ~50 batch/文件</td><td>~3.3 batch/s</td><td>~3 batch/s（利用率 93% &mdash; 满负载）</td></tr>
   </table>
   <div class="note">
-    <strong>默认配置下 Parser 才是真正瓶颈。</strong>持续吞吐约 65,000 行/秒，不是 Sender 的 100,000 名义上限。如果 65K 可接受，无需调参。
+    <strong>默认配置下 Parser 是瓶颈，Sender 大部分时间在 idle。</strong>持续吞吐约 <strong>3 batch/s &asymp; 3,000 行/秒</strong>，远低于 Sender 100,000 名义上限。Parser 慢是因为单文件内 50 个 batch &times; 每 batch 5 个串行 R2 操作（head .done + head .queued + put batchKey + put .queued + send queue），平均每 op ~588 ms（在长 invocation 内 R2 binding 的真实开销）&mdash; 单文件 ~150 秒 I/O wall time。
   </div>
-  <p>如果需要接近 100K，最稳妥的做法是调高 Parser <code>max_concurrency</code>：</p>
+  <p>如果要更快跑完，唯一安全的杠杆是调高 Parser <code>max_concurrency</code>：</p>
   <table>
-    <tr><th>目标持续吞吐</th><th>Parser <code>max_concurrency</code></th><th><code>BACKFILL_RATE</code>（文件/分钟）</th><th>风险</th></tr>
-    <tr><td>~65K 行/秒</td><td><code>10</code>（默认）</td><td><code>60</code></td><td>无 &mdash; 当前默认</td></tr>
-    <tr><td>~85K 行/秒</td><td><code>14</code></td><td><code>60</code></td><td>低 &mdash; 仅多几个 Parser invocation</td></tr>
-    <tr><td>~100K 行/秒</td><td><code>16&ndash;18</code></td><td><code>60&ndash;80</code></td><td>低 &mdash; 距 250 平台上限仍很远</td></tr>
+    <tr><th>Parser <code>max_concurrency</code></th><th>预期持续吞吐</th><th>同样 651 文件预期完成时间</th><th>风险</th></tr>
+    <tr><td><code>10</code>（默认）</td><td>~3 batch/s</td><td>~2.5 小时</td><td>无 &mdash; 当前默认</td></tr>
+    <tr><td><code>20</code></td><td>~6 batch/s</td><td>~1.4 小时</td><td>低 &mdash; R2 操作量翻倍，仍远低于平台限制</td></tr>
+    <tr><td><code>30</code></td><td>~9 batch/s</td><td>~55 分钟</td><td>中 &mdash; 持续 R2 binding 压力可能让单 op 延迟劣化</td></tr>
+    <tr><td><code>50+</code></td><td>不确定</td><td>不确定</td><td>不推荐 &mdash; 单 op 延迟可能非线性增长</td></tr>
   </table>
   <div class="warn">
-    <strong>不要</strong>调高 Sender <code>max_concurrency</code> 超过 20，<strong>不要</strong>缩短 <code>MIN_SENDER_INVOCATION_MS</code> 低于 200。两者都会超出接收端实测容量，并可能影响同一接收端上的生产 worker。
+    <strong>不要</strong>调高 Sender <code>max_concurrency</code> 超过 20，<strong>不要</strong>缩短 <code>MIN_SENDER_INVOCATION_MS</code> 低于 200。Sender 已经有大量富余 &mdash; 瓶颈在上游。动这两个参数只会给接收端和同一域名上的生产 worker 增加压力，没有收益。
   </div>
   <p>针对大 raw 文件，parse queue 特意配置为 <code>max_batch_size = 1</code>，这样每个大 gzip 文件独占一个 invocation，不会和另外两个大文件共享同一个 invocation 的 CPU 预算。</p>
+  <p><em>注：单 batch 的 parser I/O 成本（每 R2 op ~588 ms &times; 5 ops）是<strong>长 Worker invocation 内多次串行 R2 操作累积的特性</strong>，不是单个 R2 操作本身慢。Sender 单 batch invocation 用类似的 R2 调用 &lt;100 ms 就能跑完，因为 invocation 短。</em></p>
 
   <h2>观察</h2>
-  <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
-wrangler tail ctyun-logpush-backfill</code></pre>
-  <p>默认 <code>/backfill/status</code> 是"人话版"，关键字段：</p>
+  <p>有两个独立的观察通道：HTTP status 接口（聚合进度）和 Worker 日志（per-batch 发送证据）。</p>
+
+  <h3>1. <code>/backfill/status</code> &mdash; 聚合进度</h3>
+  <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status</code></pre>
+  <p>关键字段：</p>
   <table>
     <tr><th>字段</th><th>含义</th></tr>
     <tr><td><code>summary</code></td><td>一句话状态总结</td></tr>
@@ -142,7 +146,28 @@ wrangler tail ctyun-logpush-backfill</code></pre>
     <tr><td><code>replay_window_beijing</code></td><td>北京时间下的补传时间窗</td></tr>
     <tr><td><code>last_refresh_beijing</code></td><td>上次状态更新时间</td></tr>
   </table>
-  <p>同样这份"人话版"内容也会写进 <code>cdn-logs-raw/backfill-state/status.json</code>，方便直接在 R2 UI 查看。要排障看原始状态和底层 artifact 统计，用 <code>GET /backfill/status?view=raw</code>。</p>
+  <p>要看原始状态和底层 artifact 统计，用 <code>GET /backfill/status?view=raw</code>。</p>
+
+  <h3>2. Worker 日志 &mdash; 每个 batch 的发送证据</h3>
+  <pre><code>wrangler tail ctyun-logpush-backfill</code></pre>
+  <p>每次 Sender invocation 成功都会输出一行：</p>
+  <pre><code>[BACKFILL][INFO] Sent batch lines=1000 bytes=1064735 (uncompressed)
+  -&gt; HTTP 200 | ack_ms=408 queue_wait_ms=525 | processed-backfill/.../batch.txt</code></pre>
+  <table>
+    <tr><th>字段</th><th>含义</th></tr>
+    <tr><td><code>ack_ms</code></td><td><code>fetch()</code> 开始到接收端 HTTP 响应的时间（往返 + 接收端处理）</td></tr>
+    <tr><td><code>queue_wait_ms</code></td><td>batch 在 send-queue 里的总等待时间（从 Parser 入队到 Sender 接走+发送完）</td></tr>
+    <tr><td><code>bytes</code></td><td>解压前的 payload 大小；gzip 压缩后约 1/10</td></tr>
+  </table>
+  <p>Parser 也会输出 <code>Parsing: ...</code> 和 <code>Done: ...</code>，两条日志的时间差就是单文件 wall time。</p>
+
+  <h3><code>backfill-state/</code> 下会出现的文件</h3>
+  <table>
+    <tr><th>文件</th><th>什么时候写入</th></tr>
+    <tr><td><code>progress.json</code></td><td>每次 cron tick (~1/min) 更新；run 一启动就有</td></tr>
+    <tr><td><code>status.json</code></td><td><strong>仅</strong>当有人 <code>GET /backfill/status</code> 时写入。如果从未 curl 过这个接口，R2 上就不会出现这个文件。</td></tr>
+  </table>
+  <p><strong>当前代码不写的文件：</strong> <code>send-stats.json</code>（聚合 ack_ms / queue_wait_ms 统计）在 queue-only 重构时被移除了。每个 batch 的 <code>ack_ms</code> / <code>queue_wait_ms</code> 只会输出到 Worker 日志（见上面通道 2）&mdash; 不会聚合到任何 R2 文件。如果你在某个老 bucket 上看到 <code>send-stats.json</code>，那是旧版本代码留下的残留数据。</p>
 
   <h2>清理生命周期</h2>
   <p>所有 batch 发送完成后：</p>

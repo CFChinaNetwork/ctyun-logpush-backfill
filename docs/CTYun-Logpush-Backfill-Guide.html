@@ -104,31 +104,35 @@ wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 wrangler deploy --config wrangler-backfill.toml</code></pre>
 
   <h2>Throughput &amp; Tuning</h2>
-  <p>The pipeline has two independent ceilings &mdash; the lower one wins:</p>
+  <p>The pipeline has two independent ceilings &mdash; the lower one wins. The numbers below come from a real customer run (vivo, 651 raw files, 95-min replay window, 27,908 batches, completed in ~2.5 hours).</p>
   <table>
-    <tr><th>Stage</th><th>Configuration</th><th>Theoretical ceiling</th></tr>
-    <tr><td>Sender</td><td><code>max_concurrency=20</code> &times; 200ms floor &times; 1000 lines/batch</td><td><strong>100,000 lines/s</strong></td></tr>
-    <tr><td>Parser</td><td><code>max_concurrency=10</code> &times; ~15s wall time per 100K-line file &times; 100 batches/file</td><td><strong>~65,000 lines/s</strong></td></tr>
+    <tr><th>Stage</th><th>Configuration</th><th>Theoretical ceiling</th><th>Real-world throughput</th></tr>
+    <tr><td>Sender</td><td><code>max_concurrency=20</code> &times; ~0.55s per invocation (incl. ACK ~400ms)</td><td>~36 batch/s</td><td>~3 batch/s (8% utilization &mdash; idle most of the time)</td></tr>
+    <tr><td>Parser</td><td><code>max_concurrency=10</code> &times; ~150s wall time per 100K-line file &times; ~50 batches/file</td><td>~3.3 batch/s</td><td>~3 batch/s (93% utilization &mdash; fully loaded)</td></tr>
   </table>
   <div class="note">
-    <strong>Under default config the Parser is the actual bottleneck.</strong> Sustained throughput is therefore around 65,000 lines/s, not the Sender's 100,000 nameplate. If 65K is acceptable, no tuning is required.
+    <strong>Under default config the Parser is the bottleneck and Sender is mostly idle.</strong> Sustained throughput is around <strong>3 batch/s &asymp; 3,000 lines/s</strong>, far below the Sender&apos;s 100,000 nameplate. The Parser slowness is dominated by the 5 sequential R2 operations per batch (head .done + head .queued + put batchKey + put .queued + send queue), each averaging ~588 ms inside a long-running parser invocation. With ~50 batches per 100K-line file, that&apos;s ~150 seconds of I/O wall time per file.
   </div>
-  <p>If you need to push closer to 100K, the safe path is to raise Parser <code>max_concurrency</code>:</p>
+  <p>If you need to finish faster, the only safe lever is raising Parser <code>max_concurrency</code>:</p>
   <table>
-    <tr><th>Target sustained throughput</th><th>Parser <code>max_concurrency</code></th><th><code>BACKFILL_RATE</code> (file/min)</th><th>Risk</th></tr>
-    <tr><td>~65K lines/s</td><td><code>10</code> (default)</td><td><code>60</code></td><td>None &mdash; current default</td></tr>
-    <tr><td>~85K lines/s</td><td><code>14</code></td><td><code>60</code></td><td>Low &mdash; extra Parser invocations only</td></tr>
-    <tr><td>~100K lines/s</td><td><code>16&ndash;18</code></td><td><code>60&ndash;80</code></td><td>Low &mdash; well under platform 250 limit</td></tr>
+    <tr><th>Parser <code>max_concurrency</code></th><th>Expected sustained throughput</th><th>Expected duration for the same 651-file run</th><th>Risk</th></tr>
+    <tr><td><code>10</code> (default)</td><td>~3 batch/s</td><td>~2.5 hours</td><td>None &mdash; current default</td></tr>
+    <tr><td><code>20</code></td><td>~6 batch/s</td><td>~1.4 hours</td><td>Low &mdash; R2 op count doubles, still far from any platform limit</td></tr>
+    <tr><td><code>30</code></td><td>~9 batch/s</td><td>~55 min</td><td>Medium &mdash; sustained R2 binding pressure may degrade per-op latency at this density</td></tr>
+    <tr><td><code>50+</code></td><td>uncertain</td><td>uncertain</td><td>Not recommended &mdash; per-op latency may grow non-linearly</td></tr>
   </table>
   <div class="warn">
-    Do <strong>not</strong> raise Sender <code>max_concurrency</code> above 20 or shorten <code>MIN_SENDER_INVOCATION_MS</code> below 200. Both would exceed the receiver's tested capacity and may impact the production worker on the same endpoint.
+    Do <strong>not</strong> raise Sender <code>max_concurrency</code> above 20 or shorten <code>MIN_SENDER_INVOCATION_MS</code> below 200. Sender already has plenty of headroom &mdash; the bottleneck is upstream. Touching these would only risk pressuring the receiver and the production worker on the same endpoint.
   </div>
   <p>For large raw files, parse queue is intentionally configured as <code>max_batch_size = 1</code>, so each large gzip file gets its own invocation instead of sharing CPU time with two other large files.</p>
+  <p><em>Note: the per-batch parser I/O cost (~588 ms / R2 op &times; 5 ops) is a property of running many sequential R2 ops inside a single long Worker invocation, not of any individual operation. Sender single-batch invocations issue similar R2 calls in &lt;100 ms total because each invocation is short-lived.</em></p>
 
   <h2>Monitoring</h2>
-  <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
-wrangler tail ctyun-logpush-backfill</code></pre>
-  <p>The default <code>/backfill/status</code> response is human-friendly. Key fields:</p>
+  <p>There are two independent monitoring channels: the HTTP status endpoint (aggregated progress) and Worker logs (per-batch send evidence).</p>
+
+  <h3>1. <code>/backfill/status</code> &mdash; aggregated progress</h3>
+  <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status</code></pre>
+  <p>Key fields:</p>
   <table>
     <tr><th>Field</th><th>Meaning</th></tr>
     <tr><td><code>summary</code></td><td>One-line plain-language status</td></tr>
@@ -142,7 +146,28 @@ wrangler tail ctyun-logpush-backfill</code></pre>
     <tr><td><code>replay_window_beijing</code></td><td>Replay window in Beijing time</td></tr>
     <tr><td><code>last_refresh_beijing</code></td><td>Last status update time</td></tr>
   </table>
-  <p>The same human-friendly payload is also written to <code>cdn-logs-raw/backfill-state/status.json</code> so you can inspect it directly in the R2 UI. Use <code>GET /backfill/status?view=raw</code> if you want the raw state document plus low-level artifact stats.</p>
+  <p>Use <code>GET /backfill/status?view=raw</code> for the raw state document plus low-level artifact stats.</p>
+
+  <h3>2. Worker logs &mdash; per-batch send evidence</h3>
+  <pre><code>wrangler tail ctyun-logpush-backfill</code></pre>
+  <p>Every successful Sender invocation emits one line like:</p>
+  <pre><code>[BACKFILL][INFO] Sent batch lines=1000 bytes=1064735 (uncompressed)
+  -&gt; HTTP 200 | ack_ms=408 queue_wait_ms=525 | processed-backfill/.../batch.txt</code></pre>
+  <table>
+    <tr><th>Field</th><th>Meaning</th></tr>
+    <tr><td><code>ack_ms</code></td><td>Time from <code>fetch()</code> start to receiver HTTP response (round-trip + receiver processing)</td></tr>
+    <tr><td><code>queue_wait_ms</code></td><td>Time the batch sat in send-queue (from Parser enqueue to Sender pick-up + send)</td></tr>
+    <tr><td><code>bytes</code></td><td>Uncompressed payload size; gzip-compressed body is ~10&times; smaller</td></tr>
+  </table>
+  <p>Parser also emits <code>Parsing: ...</code> and <code>Done: ...</code> per file, which lets you measure single-file wall time (subtract the two timestamps).</p>
+
+  <h3>Files that exist in <code>backfill-state/</code></h3>
+  <table>
+    <tr><th>File</th><th>When written</th></tr>
+    <tr><td><code>progress.json</code></td><td>Updated by every cron tick (~1/min); always present once a run starts</td></tr>
+    <tr><td><code>status.json</code></td><td>Written <strong>only</strong> when someone hits <code>GET /backfill/status</code>. If no one ever curls the endpoint, this file does not exist in R2.</td></tr>
+  </table>
+  <p><strong>Files that do NOT exist in the current code:</strong> <code>send-stats.json</code> (aggregate ack_ms/queue_wait_ms statistics) was removed in the queue-only refactor. Per-batch <code>ack_ms</code> / <code>queue_wait_ms</code> are emitted to Worker logs only (see channel 2 above) &mdash; they are not aggregated into any R2 file. If you see a <code>send-stats.json</code> in an old bucket, it is leftover data from a previous code version.</p>
 
   <h2>Cleanup Lifecycle</h2>
   <p>After all batches are delivered:</p>

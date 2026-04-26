@@ -64,12 +64,22 @@ Do not change `BACKFILL_START_TIME` / `BACKFILL_END_TIME` while a run is active.
 
 ## Monitoring
 
+Two independent channels:
+
 ```bash
+# 1. Aggregated progress (human-friendly JSON, Beijing time)
 curl https://ctyun-logpush-backfill.<your-subdomain>.workers.dev/backfill/status
+
+# 2. Per-batch send evidence (ack_ms / queue_wait_ms in every "Sent batch ..." line)
 wrangler tail ctyun-logpush-backfill
 ```
 
-The status payload is human-friendly (Beijing time, plain-language summary) and is also persisted to `cdn-logs-raw/backfill-state/status.json` for direct R2 UI viewing. Use `?view=raw` for low-level state and artifact stats. See the guides below for the full field list and re-run / cleanup details.
+Files in `backfill-state/`:
+
+- `progress.json` — updated every cron tick (~1/min), always present after a run starts
+- `status.json` — written **only** when someone hits `GET /backfill/status` (does not exist if never queried)
+
+`send-stats.json` does **not** exist in the current code. Per-batch `ack_ms` and `queue_wait_ms` are emitted to Worker logs only, not aggregated into R2. See the guides below for the full field list, tuning table, and re-run / cleanup details.
 
 ## Documentation
 
