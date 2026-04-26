@@ -69,6 +69,7 @@ wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
 wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 
 wrangler deploy --config wrangler-backfill.toml</code></pre>
+  <p>如果要把完全相同的时间窗重新跑一遍，请先删除 <code>cdn-logs-raw/backfill-state/progress.json</code>，然后重新 deploy，或保持 <code>BACKFILL_ENABLED=true</code> 等下一次 cron。旧的 <code>processed-backfill/&lt;run-id&gt;/</code> 前缀不会阻塞新的 run。</p>
 
   <h2>调速</h2>
   <p>当前 checked-in 的 sender 理论 ceiling：</p>
@@ -93,7 +94,15 @@ BATCH_SIZE = 1000
   <h2>观察</h2>
   <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill</code></pre>
-  <p>运维上请以 queue backlog 和 sender 日志为准。sender 日志里会带 <code>ack_ms</code> 和 <code>queue_wait_ms</code>。</p>
+  <p>默认的 <code>/backfill/status</code> 是“人话版”，会直接告诉你：</p>
+  <ul>
+    <li>这个时间窗一共匹配了多少个 raw 文件</li>
+    <li>send worker 目前一共发了多少个 batch</li>
+    <li>目前一共已经发了多少条日志</li>
+    <li>batch 的平均/最小/最大行数，方便判断 batch 是否大多接近 1000 条</li>
+    <li>北京时间时间戳，以及“R2 Dashboard 里的 Date Created 不能当最新 run 时间”的说明</li>
+  </ul>
+  <p>如果要排障看原始状态和底层 artifact 统计，用 <code>GET /backfill/status?view=raw</code>。</p>
 
   <h2>什么时候算结束</h2>
   <p>最稳妥的判断条件：</p>

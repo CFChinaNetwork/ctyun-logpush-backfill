@@ -225,7 +225,7 @@ async function processFile(msg, env) {
 }
 
 async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
-  const batchKey = buildBatchKey(sourceKey, index, run.id);
+  const batchKey = buildBatchKey(sourceKey, index, run.id, lines.length);
   const queuedMarkerKey = `${batchKey}.queued`;
 
   const doneMarker = await env.RAW_BUCKET.head(`${batchKey}.done`).catch(() => null);
@@ -485,6 +485,7 @@ async function loadState(env, config) {
     phase: 'enqueue',
     status: 'running',
     started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
     enqueue_progress: {},
     enqueued_count: 0,
     last_cron_at: null,
@@ -494,6 +495,7 @@ async function loadState(env, config) {
 }
 
 async function saveState(env, state) {
+  state.updated_at = new Date().toISOString();
   state.last_cron_at = new Date().toISOString();
   await env.RAW_BUCKET.put(STATE_KEY, JSON.stringify(state, null, 2), {
     httpMetadata: { contentType: 'application/json; charset=utf-8' },
@@ -707,7 +709,11 @@ async function handleFetch(request, env) {
 
     try {
       const data = JSON.parse(await obj.text());
-      return jsonResponse(data);
+      const artifactStats = await collectRunArtifactStats(env, data.run_id, parsePositiveInt(env.BATCH_SIZE, DEFAULT_BATCH_SIZE, 1));
+      if (url.searchParams.get('view') === 'raw') {
+        return jsonResponse({ ...data, artifact_stats: artifactStats });
+      }
+      return jsonResponse(buildPublicStatusResponse(data, artifactStats, env));
     } catch (error) {
       return jsonResponse({ status: 'error', message: `State file corrupted: ${error.message}` }, 500);
     }
@@ -992,10 +998,10 @@ function fmtCompactUtc(ms) {
   return `${yyyy}${mm}${dd}T${hh}${mi}${ss}Z`;
 }
 
-function buildBatchKey(sourceKey, index, runId) {
+function buildBatchKey(sourceKey, index, runId, lineCount = 0) {
   const tail = sourceKey.split('/').pop() || 'raw';
   const safeTail = tail.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
-  return `${getBatchPrefix(runId)}${safeTail}-${md5(sourceKey)}-${index}.txt`;
+  return `${getBatchPrefix(runId)}${safeTail}-${md5(sourceKey)}-${index}-n${lineCount}.txt`;
 }
 
 function getBatchPrefix(runId) {
@@ -1031,6 +1037,21 @@ function parseBatchLineCount(raw) {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 0) return null;
   return Math.floor(parsed);
+}
+
+function extractBatchLineCountFromKey(key) {
+  const match = String(key || '').match(/-n(\d+)\.txt(?:\.done|\.queued)?$/);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeBatchArtifactKey(key) {
+  if (typeof key !== 'string') return null;
+  if (key.endsWith('.done')) return key.slice(0, -'.done'.length);
+  if (key.endsWith('.queued')) return key.slice(0, -'.queued'.length);
+  if (key.endsWith('.txt')) return key;
+  return null;
 }
 
 function parsePositiveInt(raw, fallback, min) {
@@ -1162,6 +1183,168 @@ function parseQueueWaitMs(queuedAtMs) {
   return Math.max(0, Date.now() - queuedAt);
 }
 
+async function collectRunArtifactStats(env, runId, batchSize) {
+  if (!runId) return createEmptyArtifactStats(batchSize);
+
+  const prefix = getBatchPrefix(runId);
+  const batches = new Map();
+  let startAfter;
+
+  while (true) {
+    const page = await env.RAW_BUCKET.list({ prefix, startAfter, limit: LIST_LIMIT });
+
+    for (const obj of page.objects) {
+      const baseKey = normalizeBatchArtifactKey(obj.key);
+      if (!baseKey) continue;
+      const lineCount = extractBatchLineCountFromKey(baseKey);
+      const entry = batches.get(baseKey) || {
+        key: baseKey,
+        lineCount,
+        hasTxt: false,
+        hasDone: false,
+        hasQueued: false,
+      };
+      entry.lineCount = entry.lineCount ?? lineCount;
+      if (obj.key.endsWith('.done')) entry.hasDone = true;
+      else if (obj.key.endsWith('.queued')) entry.hasQueued = true;
+      else if (obj.key.endsWith('.txt')) entry.hasTxt = true;
+      batches.set(baseKey, entry);
+    }
+
+    if (isR2ListComplete(page) || page.objects.length === 0) break;
+    startAfter = page.objects[page.objects.length - 1].key;
+  }
+
+  let totalBatches = 0;
+  let sentBatches = 0;
+  let pendingBatches = 0;
+  let totalLines = 0;
+  let sentLines = 0;
+  let pendingLines = 0;
+  let minLines = null;
+  let maxLines = null;
+
+  for (const entry of batches.values()) {
+    totalBatches++;
+    const lineCount = parseBatchLineCount(entry.lineCount);
+    if (lineCount !== null) {
+      totalLines += lineCount;
+      minLines = minLines === null ? lineCount : Math.min(minLines, lineCount);
+      maxLines = maxLines === null ? lineCount : Math.max(maxLines, lineCount);
+    }
+    if (entry.hasDone) {
+      sentBatches++;
+      if (lineCount !== null) sentLines += lineCount;
+    } else {
+      pendingBatches++;
+      if (lineCount !== null) pendingLines += lineCount;
+    }
+  }
+
+  return {
+    total_batches: totalBatches,
+    sent_batches: sentBatches,
+    pending_batches: pendingBatches,
+    total_lines: totalLines,
+    sent_lines: sentLines,
+    pending_lines: pendingLines,
+    min_batch_lines: minLines,
+    max_batch_lines: maxLines,
+    avg_batch_lines: totalBatches > 0 ? Number((totalLines / totalBatches).toFixed(2)) : null,
+    configured_batch_size: batchSize,
+  };
+}
+
+function createEmptyArtifactStats(batchSize) {
+  return {
+    total_batches: 0,
+    sent_batches: 0,
+    pending_batches: 0,
+    total_lines: 0,
+    sent_lines: 0,
+    pending_lines: 0,
+    min_batch_lines: null,
+    max_batch_lines: null,
+    avg_batch_lines: null,
+    configured_batch_size: batchSize,
+  };
+}
+
+function derivePublicStage(state, artifactStats) {
+  if (state.status === 'cleaned' || state.cleanup?.status === 'done') return 'cleaned';
+  if (artifactStats.pending_batches > 0) return 'sending';
+  if (state.status === 'done' && state.cleanup?.status === 'ready') return 'sent_waiting_cleanup';
+  if (state.phase === 'enqueue') return 'scanning_and_queueing';
+  return 'running';
+}
+
+function buildHumanMessage(state, artifactStats, stage) {
+  const linesInfo = `${artifactStats.sent_lines}/${artifactStats.total_lines} 条日志`;
+  const batchInfo = `${artifactStats.sent_batches}/${artifactStats.total_batches} 个 batch`;
+  if (stage === 'cleaned') {
+    return `这次补传已经完成并清理完临时文件。共匹配 ${state.enqueued_count ?? 0} 个原始文件，发送 ${batchInfo}，约 ${linesInfo}。`;
+  }
+  if (stage === 'sent_waiting_cleanup') {
+    return `这次补传已经发送完成。共匹配 ${state.enqueued_count ?? 0} 个原始文件，发送 ${batchInfo}，约 ${linesInfo}，当前只是等待自动清理临时文件。`;
+  }
+  if (stage === 'sending') {
+    return `这次补传已经匹配 ${state.enqueued_count ?? 0} 个原始文件，已发送 ${batchInfo}，约 ${linesInfo}，还有 ${artifactStats.pending_batches} 个 batch 待发送。`;
+  }
+  return `这次补传正在扫描并排队，当前已匹配 ${state.enqueued_count ?? 0} 个原始文件。`;
+}
+
+function toBeijingTime(value) {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms + 8 * 3600 * 1000);
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mi = String(d.getUTCMinutes()).padStart(2, '0');
+  const ss = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} GMT+8`;
+}
+
+function buildPublicStatusResponse(state, artifactStats, env) {
+  const stage = derivePublicStage(state, artifactStats);
+  const checkedAt = new Date().toISOString();
+  const lastUpdatedAt = state.updated_at || state.last_cron_at || state.completed_at || state.started_at || null;
+  return {
+    status: state.status,
+    stage,
+    message: buildHumanMessage(state, artifactStats, stage),
+    run_id: state.run_id,
+    window_start: state.config?.start || null,
+    window_end: state.config?.end || null,
+    started_at: state.started_at || null,
+    started_at_beijing: toBeijingTime(state.started_at),
+    enqueue_completed_at: state.completed_at || null,
+    enqueue_completed_at_beijing: toBeijingTime(state.completed_at),
+    last_updated_at: lastUpdatedAt,
+    last_updated_at_beijing: toBeijingTime(lastUpdatedAt),
+    status_checked_at: checkedAt,
+    status_checked_at_beijing: toBeijingTime(checkedAt),
+    raw_files_matched: state.enqueued_count ?? 0,
+    raw_files_per_minute_limit: state.config?.rate ?? null,
+    batches_sent: artifactStats.sent_batches,
+    batches_total: artifactStats.total_batches,
+    batches_pending: artifactStats.pending_batches,
+    log_lines_sent: artifactStats.sent_lines,
+    log_lines_total: artifactStats.total_lines,
+    log_lines_pending: artifactStats.pending_lines,
+    batch_size_max_configured: artifactStats.configured_batch_size,
+    batch_lines_avg: artifactStats.avg_batch_lines,
+    batch_lines_min: artifactStats.min_batch_lines,
+    batch_lines_max: artifactStats.max_batch_lines,
+    batch_size_note: `单个 batch 最多 ${artifactStats.configured_batch_size} 条；多数 batch 会接近上限，最后一个尾 batch 可能更小。`,
+    cleanup: state.cleanup,
+    rerun_hint: '如果同一时间窗需要重新跑，请先删除 R2 里的 backfill-state/progress.json，再保持 BACKFILL_ENABLED=true 重新部署或等待下一次 cron。旧 run 的 processed-backfill/<run-id>/ 不会影响新 run。',
+    ui_time_note: 'R2 Dashboard 里 progress.json 的 Date Created 不是这次 run 是否最新的判断依据。请以 started_at、last_updated_at 和 status_checked_at 为准。',
+  };
+}
+
 async function writeDoneMarkerWithRetry(env, key) {
   const markerKey = `${key}.done`;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1182,13 +1365,19 @@ async function writeDoneMarkerWithRetry(env, key) {
 }
 
 export const __test = {
+  buildHumanMessage,
   buildBatchKey,
   buildParseQueueMessage,
+  buildPublicStatusResponse,
   buildRunId,
   buildRunInstanceId,
   canReinitializeFromState,
+  collectRunArtifactStats,
   compactStateAfterCleanup,
+  createEmptyArtifactStats,
   createInitialCleanupState,
+  derivePublicStage,
+  extractBatchLineCountFromKey,
   extractFileTimeRange,
   getBatchPrefix,
   isPendingCleanupArtifact,
@@ -1202,6 +1391,7 @@ export const __test = {
   parseQueueWaitMs,
   parseSendTimeoutMs,
   resolveRunContext,
+  toBeijingTime,
   writeBatchAndEnqueue,
   writeDoneMarkerWithRetry,
 };

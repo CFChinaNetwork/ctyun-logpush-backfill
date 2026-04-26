@@ -49,6 +49,8 @@ wrangler deploy --config wrangler-backfill.toml
 
 Do not change `BACKFILL_START_TIME` / `BACKFILL_END_TIME` while an existing run is still active. Wait until `/backfill/status` reports `status = "cleaned"` first.
 
+If you must replay the same time window again, delete `cdn-logs-raw/backfill-state/progress.json` first, then redeploy (or keep `BACKFILL_ENABLED = "true"` and wait for the next cron tick). Old `processed-backfill/<run-id>/` prefixes do not block a new run because each run uses a fresh `run_id`.
+
 ## Architecture
 
 ```text
@@ -67,12 +69,24 @@ wrangler tail ctyun-logpush-backfill
 Key status fields:
 
 - `status`
+- `stage`
+- `message`
 - `run_id`
-- `phase`
-- `config.start` / `config.end`
-- `enqueued_count`
+- `window_start` / `window_end`
+- `raw_files_matched`
+- `batches_sent` / `batches_total` / `batches_pending`
+- `log_lines_sent` / `log_lines_total` / `log_lines_pending`
+- `batch_lines_avg` / `batch_lines_min` / `batch_lines_max`
+- `batch_size_note`
+- `started_at_beijing`
+- `enqueue_completed_at_beijing`
+- `last_updated_at_beijing`
+- `status_checked_at_beijing`
 - `cleanup`
-- sender logs with `ack_ms` and `queue_wait_ms`
+- `rerun_hint`
+- `ui_time_note`
+
+Use `GET /backfill/status?view=raw` when you want the raw state file plus low-level artifact stats.
 
 ## Safety Defaults
 
@@ -81,7 +95,7 @@ Key status fields:
 - Sender hard-capped at `<= 100,000 lines/s` with the current checked-in configuration when batches are near the configured `BATCH_SIZE = 1000`
 - Delivery semantics are **at-least-once**, not exactly-once. If a customer POST succeeds but the `.done` marker cannot be persisted, the batch is retried and the receiver should dedupe by batch identity if strict exactly-once is required.
 - Temporary artifacts under `processed-backfill/<run-id>/` are auto-cleaned after a successful run with a long safety delay
-- Sender evidence (`ack_ms`, `queue_wait_ms`) is emitted in Worker logs; it is intentionally not persisted on the hot path
+- Sender evidence (`ack_ms`, `queue_wait_ms`) is emitted in Worker logs; `/backfill/status` now also gives a direct batch/log-line reconciliation view without adding a shared hot-path counter
 
 ## Documentation
 
