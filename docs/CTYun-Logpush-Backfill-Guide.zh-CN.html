@@ -17,19 +17,56 @@
 </head>
 <body>
   <h1>天翼云 Logpush Backfill 指南</h1>
-  <p>这是最终版轻量 backfill 方案。它会把指定时间窗内的 R2 历史日志重新取出，过滤 Worker 子请求，转换为天翼云要求的格式，并按明确限速发送到客户接收端。</p>
+  <p>这是轻量版 backfill 方案。它在指定时间窗内把 R2 历史日志重新取出，过滤 Worker 子请求，转换为天翼云要求的格式，并按明确限速发送到客户接收端。</p>
+
+  <h2>客户端约束</h2>
+  <p>整个设计围绕三个客户端硬性要求：</p>
+
+  <h3>1. 接收端吞吐上限（约 100,000 行/秒）</h3>
+  <p>客户接收端无法承受任意速率。Sender 通过下式硬封顶：</p>
+  <pre><code>max_concurrency × (1000ms / MIN_SENDER_INVOCATION_MS) × BATCH_SIZE
+= 20 × (1000 / 200) × 1000
+= 100,000 行/秒</code></pre>
+  <p>这是<strong>理论上限</strong>，前提是每个 batch 接近 <code>BATCH_SIZE = 1000</code> 行，且客户 ACK 延迟低于 200ms。<strong>实际持续吞吐还受 Parser 上游供给限制</strong> &mdash; 见下方 <em>吞吐与调速</em>。</p>
+
+  <h3>2. 接收端不做去重</h3>
+  <div class="warn">
+    投递语义是 <strong>at-least-once（至少一次）</strong>，不是 exactly-once。客户接收端无法去重，所以 Worker 通过两个 R2 标记（<code>.done</code> 与 <code>.queued</code>）尽量减少重复。常见场景（Parser 重试、Queue 重复投递）已经被消除，但还有两种残留场景<strong>无法消除</strong>：
+    <ul>
+      <li><strong>fetch abort 但接收端已处理</strong> &mdash; <code>SEND_TIMEOUT_MS</code> 触发，但 POST 实际已被接收端接受。Worker 无法得知。重试 &rarr; 接收端收到第 2 份。正常情况下概率 &lt; 0.001%。</li>
+      <li><strong>POST 成功但 <code>.done</code> 写入失败</strong> &mdash; R2 PUT 永久性失败（已 3 次内部重试）。没有 <code>.done</code> 时下一次重试会重发。概率 &lt; 0.0001%。</li>
+    </ul>
+    每个 batch 在 R2 key 中带稳定的 batch identity。<em>能去重</em>的接收端应按此 identity 去重。<em>不能去重</em>的接收端需要把残留重复率视为已知风险。
+  </div>
+
+  <h3>3. 不传 Worker 子请求</h3>
+  <p>客户按父请求计费/审计。Parser 按以下规则在每条记录上过滤：</p>
+  <pre><code>ParentRayID !== "00"        // 即子请求
+WorkerSubrequest === true   // 显式子请求标记</code></pre>
+  <p>两条规则都在格式转换之前应用。</p>
+
+  <h2>与生产 Worker 共存</h2>
+  <p>生产 worker <a href="https://github.com/CFChinaNetwork/ctyun-logpush-worker"><code>ctyun-logpush-worker</code></a> 实时把日志推到<strong>同一个客户接收端</strong>，量级相近。Backfill 在 Cloudflare 层完全隔离：</p>
+  <table>
+    <tr><th>资源</th><th>生产</th><th>Backfill</th><th>是否共享</th></tr>
+    <tr><td>Worker isolate / CPU 配额</td><td><code>ctyun-logpush</code></td><td><code>ctyun-logpush-backfill</code></td><td>独立</td></tr>
+    <tr><td>Queues</td><td><code>parse-queue</code> / <code>send-queue</code></td><td><code>parse-queue-backfill</code> / <code>send-queue-backfill</code></td><td>独立</td></tr>
+    <tr><td>R2 bucket</td><td><code>cdn-logs-raw</code></td><td><code>cdn-logs-raw</code></td><td>共享（前缀不同）</td></tr>
+    <tr><td>R2 前缀</td><td><code>processed/</code></td><td><code>processed-backfill/&lt;run-id&gt;/</code></td><td>独立</td></tr>
+    <tr><td>客户接收端</td><td>共享</td><td>共享</td><td>共享（下游压力共担）</td></tr>
+  </table>
+  <p>含义：backfill 假死（比如客户接收端卡住）<strong>不会</strong>消耗生产 worker 的 concurrency 或 queue 槽位。两个 worker 共享接收端带宽，所以 backfill 的显式限速是保护接收端的关键。</p>
 
   <h2>架构</h2>
   <pre><code>R2 logs/
 -> parse-queue-backfill
--> Parser
--> processed-backfill/&lt;run-id&gt;/
+-> Parser  （gzip 解码 + 过滤 + 转换 + 切成 1000 行 batch）
+-> processed-backfill/&lt;run-id&gt;/{batch}.txt + {batch}.queued
 -> send-queue-backfill
--> Sender
--> customer endpoint</code></pre>
+-> Sender  （gzip + 签名 POST + .done 标记 + 清理）
+-> 客户接收端</code></pre>
   <div class="note">
-    <strong>热路径里不再使用 Durable Object。</strong>
-    每个 raw 文件独立解析，并直接写成最终 batch 文件。
+    <strong>热路径里不使用 Durable Object。</strong>每个 raw <code>.gz</code> 文件独立解析并直接写成最终 batch 文件。每文件最后一个 batch 可能不满 1000 行 &mdash; 这是可接受的。
   </div>
 
   <h2>这套方案保证什么</h2>
@@ -38,26 +75,22 @@
     <li>只发送父请求：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code></li>
     <li>使用和生产一致的 CTYun 鉴权 secrets 做 POST</li>
     <li>通过 queue 并发 + 200ms invocation floor 对 sender 做显式限速</li>
-    <li>run 完成后自动清理临时 batch 文件</li>
+    <li>run 完成后自动清理临时 batch 文件（24 小时宽限）</li>
   </ul>
-
-  <h2>投递语义</h2>
-  <div class="warn">
-    <strong>重要：</strong>这套方案是 <strong>at-least-once</strong>，不是 exactly-once。
-    如果客户 POST 已成功，但 Worker 随后没能写下 <code>.done</code> 标记，那么这个 batch 会被重试。
-    如果客户侧要求严格去重，需要按 batch identity 在接收端做 dedupe。
-  </div>
 
   <h2>部署</h2>
   <table>
-    <tr><th>字段</th><th>含义</th></tr>
-    <tr><td><code>BACKFILL_START_TIME</code></td><td>补传开始时间，ISO 8601</td></tr>
-    <tr><td><code>BACKFILL_END_TIME</code></td><td>补传结束时间，ISO 8601，且必须是过去时间</td></tr>
-    <tr><td><code>BACKFILL_ENABLED</code></td><td>必须显式设成 <code>true</code> 才会运行；checked-in 默认值是 <code>false</code></td></tr>
-    <tr><td><code>BACKFILL_RATE</code></td><td>每分钟最多 enqueue 多少个 raw 文件。当前 checked-in 起步值是 <code>60</code>。</td></tr>
-    <tr><td><code>BATCH_SIZE</code></td><td>每次 POST 最多多少条日志，默认 <code>1000</code></td></tr>
-    <tr><td><code>SEND_TIMEOUT_MS</code></td><td>sender 等客户 ACK 的最长时间</td></tr>
+    <tr><th>变量</th><th>默认</th><th>含义</th></tr>
+    <tr><td><code>BACKFILL_START_TIME</code></td><td><code>""</code></td><td>补传开始时间，ISO 8601</td></tr>
+    <tr><td><code>BACKFILL_END_TIME</code></td><td><code>""</code></td><td>补传结束时间，ISO 8601，必须 <code>&lt;= 当前时间</code></td></tr>
+    <tr><td><code>BACKFILL_ENABLED</code></td><td><code>"false"</code></td><td>必须显式 <code>"true"</code> 才运行</td></tr>
+    <tr><td><code>BACKFILL_RATE</code></td><td><code>"60"</code></td><td>每分钟入队文件数（上限 100）</td></tr>
+    <tr><td><code>BATCH_SIZE</code></td><td><code>"1000"</code></td><td>每次 POST 行数。在未确认接收端容量前不要调高。</td></tr>
+    <tr><td><code>SEND_TIMEOUT_MS</code></td><td><code>"300000"</code></td><td>等客户 ACK 的最长时间。客户实测 ACK 1&ndash;5 秒，长 timeout 是为了最小化 abort 引起的重复。</td></tr>
+    <tr><td><code>LOG_PREFIX</code></td><td><code>"logs/"</code></td><td>Logpush 在 R2 的根前缀</td></tr>
+    <tr><td><code>LOG_LEVEL</code></td><td><code>"info"</code></td><td><code>debug</code> / <code>info</code> / <code>warn</code> / <code>error</code></td></tr>
   </table>
+  <p>最大补传时间窗：7 天（<code>MAX_RANGE_HOURS = 24 * 7</code>）。更大时间窗需要拆成多次运行。</p>
 
   <pre><code>wrangler queues create parse-queue-backfill
 wrangler queues create send-queue-backfill
@@ -69,48 +102,73 @@ wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
 wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 
 wrangler deploy --config wrangler-backfill.toml</code></pre>
-  <p>如果要把完全相同的时间窗重新跑一遍，请先删除 <code>cdn-logs-raw/backfill-state/progress.json</code> 和 <code>cdn-logs-raw/backfill-state/status.json</code>，然后重新 deploy，或保持 <code>BACKFILL_ENABLED=true</code> 等下一次 cron。旧的 <code>processed-backfill/&lt;run-id&gt;/</code> 前缀不会阻塞新的 run。</p>
 
-  <h2>调速</h2>
-  <p>当前 checked-in 的 sender 理论 ceiling：</p>
-  <pre><code>max_concurrency = 20
-max_batch_size = 1
-MIN_SENDER_INVOCATION_MS = 200
-BATCH_SIZE = 1000
-
-理论上限
-= 20 * 1 * (1000 / 200) * 1000
-= 100,000 行/秒</code></pre>
-  <p>这个上限默认假设 batch 接近 1000 行，且客户 ACK 小于 200ms。</p>
-  <p>针对大 raw 文件，parse queue 现在特意配置为 <code>max_batch_size = 1</code>、<code>max_concurrency = 10</code>，这样每个大 gzip 文件独占一个 invocation，不会和另外两个大文件共享同一个 invocation 的 CPU 预算。</p>
-
+  <h2>吞吐与调速</h2>
+  <p>pipeline 有两个独立上限，<strong>取较低者</strong>：</p>
   <table>
-    <tr><th>目标 ceiling</th><th>推荐 sender max_concurrency</th></tr>
-    <tr><td>10,000 行/秒</td><td><code>2</code></td></tr>
-    <tr><td>20,000 行/秒</td><td><code>4</code></td></tr>
-    <tr><td>50,000 行/秒</td><td><code>10</code></td></tr>
-    <tr><td>100,000 行/秒</td><td><code>20</code></td></tr>
+    <tr><th>阶段</th><th>配置</th><th>理论上限</th></tr>
+    <tr><td>Sender</td><td><code>max_concurrency=20</code> &times; 200ms floor &times; 1000 行/batch</td><td><strong>100,000 行/秒</strong></td></tr>
+    <tr><td>Parser</td><td><code>max_concurrency=10</code> &times; 单 10 万行文件约 15 秒 wall time &times; 100 batch/文件</td><td><strong>~65,000 行/秒</strong></td></tr>
   </table>
+  <div class="note">
+    <strong>默认配置下 Parser 才是真正瓶颈。</strong>持续吞吐约 65,000 行/秒，不是 Sender 的 100,000 名义上限。如果 65K 可接受，无需调参。
+  </div>
+  <p>如果需要接近 100K，最稳妥的做法是调高 Parser <code>max_concurrency</code>：</p>
+  <table>
+    <tr><th>目标持续吞吐</th><th>Parser <code>max_concurrency</code></th><th><code>BACKFILL_RATE</code>（文件/分钟）</th><th>风险</th></tr>
+    <tr><td>~65K 行/秒</td><td><code>10</code>（默认）</td><td><code>60</code></td><td>无 &mdash; 当前默认</td></tr>
+    <tr><td>~85K 行/秒</td><td><code>14</code></td><td><code>60</code></td><td>低 &mdash; 仅多几个 Parser invocation</td></tr>
+    <tr><td>~100K 行/秒</td><td><code>16&ndash;18</code></td><td><code>60&ndash;80</code></td><td>低 &mdash; 距 250 平台上限仍很远</td></tr>
+  </table>
+  <div class="warn">
+    <strong>不要</strong>调高 Sender <code>max_concurrency</code> 超过 20，<strong>不要</strong>缩短 <code>MIN_SENDER_INVOCATION_MS</code> 低于 200。两者都会超出接收端实测容量，并可能影响同一接收端上的生产 worker。
+  </div>
+  <p>针对大 raw 文件，parse queue 特意配置为 <code>max_batch_size = 1</code>，这样每个大 gzip 文件独占一个 invocation，不会和另外两个大文件共享同一个 invocation 的 CPU 预算。</p>
 
   <h2>观察</h2>
   <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill</code></pre>
-  <p>默认的 <code>/backfill/status</code> 是“人话版”，会直接告诉你：</p>
-  <ul>
-    <li><code>summary</code>：一句人话总结</li>
-    <li><code>status_code</code> 和 <code>stage_code</code>，并且各自带解释字段</li>
-    <li><code>delivery_completed</code>：是否已经把所有 batch 发完</li>
-    <li><code>fully_completed</code>：是否已经连临时文件清理都做完，也就是“彻底补传完成”</li>
-    <li>匹配到多少 raw 文件、已发多少 batch、已发多少日志、还剩多少 pending，以及 batch 大小分布</li>
-    <li>只显示北京时间，并明确说明“R2 Dashboard 的 Date Created 不能当最新 run 时间”</li>
-  </ul>
-  <p>同样这份“人话版”内容也会写进 <code>cdn-logs-raw/backfill-state/status.json</code>，方便你直接在 R2 UI 里看。要排障看原始状态和底层 artifact 统计，用 <code>GET /backfill/status?view=raw</code>。</p>
+  <p>默认 <code>/backfill/status</code> 是"人话版"，关键字段：</p>
+  <table>
+    <tr><th>字段</th><th>含义</th></tr>
+    <tr><td><code>summary</code></td><td>一句话状态总结</td></tr>
+    <tr><td><code>stage_code</code></td><td><code>scanning_and_queueing</code> / <code>sending</code> / <code>sent_waiting_cleanup</code> / <code>cleaned</code></td></tr>
+    <tr><td><code>delivery_completed</code></td><td><code>batches_pending == 0</code> 且全部 batch 已发送时为 <code>true</code></td></tr>
+    <tr><td><code>fully_completed</code></td><td>临时文件清理完才为 <code>true</code></td></tr>
+    <tr><td><code>matched_raw_files</code></td><td>时间窗内匹配的 raw 文件总数</td></tr>
+    <tr><td><code>batches_sent</code> / <code>batches_pending</code></td><td>已发 / 待发 batch 数</td></tr>
+    <tr><td><code>log_lines_sent</code></td><td>已发送到接收端的总行数</td></tr>
+    <tr><td><code>batch_lines_avg</code> / <code>_min</code> / <code>_max</code></td><td>batch 大小分布（每 POST 行数）</td></tr>
+    <tr><td><code>replay_window_beijing</code></td><td>北京时间下的补传时间窗</td></tr>
+    <tr><td><code>last_refresh_beijing</code></td><td>上次状态更新时间</td></tr>
+  </table>
+  <p>同样这份"人话版"内容也会写进 <code>cdn-logs-raw/backfill-state/status.json</code>，方便直接在 R2 UI 查看。要排障看原始状态和底层 artifact 统计，用 <code>GET /backfill/status?view=raw</code>。</p>
+
+  <h2>清理生命周期</h2>
+  <p>所有 batch 发送完成后：</p>
+  <ol>
+    <li><code>inspectRunArtifacts</code> &mdash; list 所有 batch artifact 并核实 <code>.done</code> 都存在</li>
+    <li><code>cleanup.status = ready</code> &mdash; 全部确认已发送后进入此状态</li>
+    <li><strong>24 小时宽限期</strong> &mdash; 临时文件保留供检查</li>
+    <li><code>cleanup.status = deleting</code> &mdash; 批量删除 <code>processed-backfill/&lt;run-id&gt;/*</code></li>
+    <li><code>cleanup.status = done</code> &mdash; state 标记为 <code>cleaned</code>，run 彻底完成</li>
+  </ol>
+  <p>宽限期是有意保留的：给运维方一个窗口在文件被删除前检查发送内容。</p>
+
+  <h2>重跑同一时间窗</h2>
+  <p>如果同一个 <code>[A, B]</code> 时间窗已经成功跑完，需要重新跑：</p>
+  <pre><code># 1. 删除 state 文件
+wrangler r2 object delete cdn-logs-raw/backfill-state/progress.json
+wrangler r2 object delete cdn-logs-raw/backfill-state/status.json
+
+# 2. 重新部署，或等待下一次 cron（保持 BACKFILL_ENABLED="true"）</code></pre>
+  <p>旧的 <code>processed-backfill/&lt;run-id&gt;/</code> 前缀<strong>不会</strong>阻塞新的 run &mdash; 每次 run 用新的 <code>run_id</code>（带时间戳后缀）。</p>
 
   <h2>什么时候算结束</h2>
   <p>最稳妥的判断条件：</p>
   <ul>
-    <li><code>/backfill/status</code> 显示 <code>status = done</code> 或 <code>cleaned</code></li>
-    <li><code>send-queue-backfill</code> backlog 归零</li>
+    <li><code>/backfill/status</code> 显示 <code>fully_completed = true</code></li>
+    <li><code>send-queue-backfill</code> backlog 归零（在 Cloudflare Dashboard 可见）</li>
   </ul>
 </body>
 </html>

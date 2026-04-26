@@ -17,18 +17,56 @@
 </head>
 <body>
   <h1>CTYun Logpush Backfill Guide</h1>
-  <p>This is the final lightweight backfill design. It replays historical R2 logs inside a precise time window, drops Worker subrequests, transforms each record to the CTYun partner format, and sends batches to the customer endpoint with explicit rate control.</p>
+  <p>This is the lightweight backfill design. It replays historical R2 logs inside a precise time window, drops Worker subrequests, transforms each record to the CTYun partner format, and sends batches to the customer endpoint with explicit rate control.</p>
+
+  <h2>Customer Constraints</h2>
+  <p>Three customer-side requirements drive the entire design:</p>
+
+  <h3>1. Receiver throughput cap (~100,000 lines/s)</h3>
+  <p>The customer endpoint cannot absorb arbitrary throughput. Sender is hard-capped at:</p>
+  <pre><code>max_concurrency × (1000ms / MIN_SENDER_INVOCATION_MS) × BATCH_SIZE
+= 20 × (1000 / 200) × 1000
+= 100,000 lines/s</code></pre>
+  <p>This is a <strong>theoretical ceiling</strong>, assuming each batch fills <code>BATCH_SIZE = 1000</code> lines and customer ACK latency is below 200ms. Actual sustained throughput is also bounded by Parser upstream supply — see <em>Throughput &amp; Tuning</em> below.</p>
+
+  <h3>2. Receiver does NOT dedupe</h3>
+  <div class="warn">
+    Delivery is <strong>at-least-once</strong>, not exactly-once. The receiver cannot deduplicate, so the Worker minimizes duplicates with two on-R2 markers (<code>.done</code> and <code>.queued</code>). These cover the common cases (Parser retry, Queue redelivery), but two residual scenarios remain:
+    <ul>
+      <li><strong>fetch abort after receiver already processed</strong> &mdash; <code>SEND_TIMEOUT_MS</code> triggers, but the POST had already been accepted by the receiver. Worker has no way to know. Retry &rarr; receiver gets the batch a second time. Probability under normal conditions: &lt; 0.001%.</li>
+      <li><strong><code>.done</code> write fails after a successful POST</strong> &mdash; R2 PUT permanent failure (3 internal retries already applied). Without <code>.done</code> the next retry resends. Probability: &lt; 0.0001%.</li>
+    </ul>
+    Each batch carries a stable batch identity in its R2 key. Receivers that <em>can</em> dedupe should key on it. Receivers that <em>cannot</em> must accept the residual duplicate rate as a known risk.
+  </div>
+
+  <h3>3. Drop Worker subrequests</h3>
+  <p>The customer is billed/audited per top-level request only. The Parser filters out per-record:</p>
+  <pre><code>ParentRayID !== "00"        // i.e. it's a subrequest
+WorkerSubrequest === true   // explicit subrequest flag</code></pre>
+  <p>Both checks run before the format transform.</p>
+
+  <h2>Coexistence with Production Worker</h2>
+  <p>The production worker <a href="https://github.com/CFChinaNetwork/ctyun-logpush-worker"><code>ctyun-logpush-worker</code></a> sends real-time logs to the <strong>same customer endpoint</strong> at a similar rate. Backfill is fully isolated at the Cloudflare layer:</p>
+  <table>
+    <tr><th>Resource</th><th>Production</th><th>Backfill</th><th>Shared?</th></tr>
+    <tr><td>Worker isolate / CPU budget</td><td><code>ctyun-logpush</code></td><td><code>ctyun-logpush-backfill</code></td><td>Independent</td></tr>
+    <tr><td>Queues</td><td><code>parse-queue</code> / <code>send-queue</code></td><td><code>parse-queue-backfill</code> / <code>send-queue-backfill</code></td><td>Independent</td></tr>
+    <tr><td>R2 bucket</td><td><code>cdn-logs-raw</code></td><td><code>cdn-logs-raw</code></td><td>Shared (different prefixes)</td></tr>
+    <tr><td>R2 prefix</td><td><code>processed/</code></td><td><code>processed-backfill/&lt;run-id&gt;/</code></td><td>Independent</td></tr>
+    <tr><td>Customer endpoint</td><td>shared</td><td>shared</td><td>Shared (downstream pressure)</td></tr>
+  </table>
+  <p>Implication: a stuck backfill (e.g. customer endpoint hangs) does <strong>not</strong> consume production Worker concurrency or queue slots. Both workers share the receiver's bandwidth, so backfill's explicit rate cap is what protects the receiver.</p>
 
   <h2>Architecture</h2>
   <pre><code>R2 logs/
 -> parse-queue-backfill
--> Parser
--> processed-backfill/&lt;run-id&gt;/
+-> Parser  (gzip decode + filter + transform + chunk into 1000-line batches)
+-> processed-backfill/&lt;run-id&gt;/{batch}.txt + {batch}.queued
 -> send-queue-backfill
--> Sender
+-> Sender  (gzip + signed POST + .done marker + cleanup)
 -> customer endpoint</code></pre>
   <div class="note">
-    <strong>No Durable Object is used in the hot path.</strong> Each raw file is parsed independently and written into final batch files directly.
+    <strong>No Durable Object is used in the hot path.</strong> Each raw <code>.gz</code> file is parsed independently and written into final batch files directly. The last batch of each file may be under-filled (fewer than 1000 lines) — this is acceptable.
   </div>
 
   <h2>What It Guarantees</h2>
@@ -37,26 +75,22 @@
     <li>Only top-level requests are forwarded: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code></li>
     <li>Authenticated POSTs using the same CTYun secrets as production</li>
     <li>Sender-side rate cap through queue concurrency + a 200ms per-invocation floor</li>
-    <li>Temporary batch files are cleaned automatically after the run completes</li>
+    <li>Temporary batch files are cleaned automatically after the run completes (24h grace period)</li>
   </ul>
-
-  <h2>Delivery Semantics</h2>
-  <div class="warn">
-    <strong>Important:</strong> this pipeline is <strong>at-least-once</strong>, not exactly-once.
-    If a customer POST succeeds but the Worker cannot persist the <code>.done</code> marker afterward,
-    the batch will be retried. If the receiver requires strict exactly-once behavior, dedupe by batch identity on the receiver side.
-  </div>
 
   <h2>Deploy</h2>
   <table>
-    <tr><th>Field</th><th>Meaning</th></tr>
-    <tr><td><code>BACKFILL_START_TIME</code></td><td>Replay start time in ISO 8601</td></tr>
-    <tr><td><code>BACKFILL_END_TIME</code></td><td>Replay end time in ISO 8601. Must be in the past.</td></tr>
-    <tr><td><code>BACKFILL_ENABLED</code></td><td>Must be set to <code>true</code> to run. The checked-in default is <code>false</code>.</td></tr>
-    <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files cron can enqueue per minute. Current checked-in starting point is <code>60</code>.</td></tr>
-    <tr><td><code>BATCH_SIZE</code></td><td>Maximum lines per POST. Default <code>1000</code>.</td></tr>
-    <tr><td><code>SEND_TIMEOUT_MS</code></td><td>How long sender waits for a customer ACK before retrying.</td></tr>
+    <tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td><code>BACKFILL_START_TIME</code></td><td><code>""</code></td><td>Replay start time, ISO 8601</td></tr>
+    <tr><td><code>BACKFILL_END_TIME</code></td><td><code>""</code></td><td>Replay end time, ISO 8601, must be <code>&lt;= now</code></td></tr>
+    <tr><td><code>BACKFILL_ENABLED</code></td><td><code>"false"</code></td><td>Must be <code>"true"</code> to run</td></tr>
+    <tr><td><code>BACKFILL_RATE</code></td><td><code>"60"</code></td><td>Files enqueued per cron minute (max 100)</td></tr>
+    <tr><td><code>BATCH_SIZE</code></td><td><code>"1000"</code></td><td>Lines per POST. Do not increase without confirming receiver capacity.</td></tr>
+    <tr><td><code>SEND_TIMEOUT_MS</code></td><td><code>"300000"</code></td><td>Max wait for customer ACK. Customer-tested ACK is 1&ndash;5s; long timeout is intentional to minimize abort-induced duplicates.</td></tr>
+    <tr><td><code>LOG_PREFIX</code></td><td><code>"logs/"</code></td><td>Logpush root prefix in R2</td></tr>
+    <tr><td><code>LOG_LEVEL</code></td><td><code>"info"</code></td><td><code>debug</code> / <code>info</code> / <code>warn</code> / <code>error</code></td></tr>
   </table>
+  <p>Maximum replay window: 7 days (<code>MAX_RANGE_HOURS = 24 * 7</code>). Larger windows must be split into multiple runs.</p>
 
   <pre><code>wrangler queues create parse-queue-backfill
 wrangler queues create send-queue-backfill
@@ -68,48 +102,73 @@ wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
 wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 
 wrangler deploy --config wrangler-backfill.toml</code></pre>
-  <p>If you need to replay the exact same window again, delete <code>cdn-logs-raw/backfill-state/progress.json</code> and <code>cdn-logs-raw/backfill-state/status.json</code> first, then redeploy or wait for the next cron tick. Older <code>processed-backfill/&lt;run-id&gt;/</code> prefixes do not block a fresh run.</p>
 
-  <h2>Tuning</h2>
-  <p>Current checked-in sender ceiling:</p>
-  <pre><code>max_concurrency = 20
-max_batch_size = 1
-MIN_SENDER_INVOCATION_MS = 200
-BATCH_SIZE = 1000
-
-theoretical ceiling
-= 20 * 1 * (1000 / 200) * 1000
-= 100,000 lines/s</code></pre>
-  <p>That ceiling assumes batches are close to 1000 lines and customer ACK stays under 200ms.</p>
-  <p>For large raw files, parse queue is intentionally configured as <code>max_batch_size = 1</code> and <code>max_concurrency = 10</code>, so each large gzip file gets its own invocation instead of sharing CPU time with two other large files.</p>
-
+  <h2>Throughput &amp; Tuning</h2>
+  <p>The pipeline has two independent ceilings &mdash; the lower one wins:</p>
   <table>
-    <tr><th>Target ceiling</th><th>Suggested sender max_concurrency</th></tr>
-    <tr><td>10,000 lines/s</td><td><code>2</code></td></tr>
-    <tr><td>20,000 lines/s</td><td><code>4</code></td></tr>
-    <tr><td>50,000 lines/s</td><td><code>10</code></td></tr>
-    <tr><td>100,000 lines/s</td><td><code>20</code></td></tr>
+    <tr><th>Stage</th><th>Configuration</th><th>Theoretical ceiling</th></tr>
+    <tr><td>Sender</td><td><code>max_concurrency=20</code> &times; 200ms floor &times; 1000 lines/batch</td><td><strong>100,000 lines/s</strong></td></tr>
+    <tr><td>Parser</td><td><code>max_concurrency=10</code> &times; ~15s wall time per 100K-line file &times; 100 batches/file</td><td><strong>~65,000 lines/s</strong></td></tr>
   </table>
+  <div class="note">
+    <strong>Under default config the Parser is the actual bottleneck.</strong> Sustained throughput is therefore around 65,000 lines/s, not the Sender's 100,000 nameplate. If 65K is acceptable, no tuning is required.
+  </div>
+  <p>If you need to push closer to 100K, the safe path is to raise Parser <code>max_concurrency</code>:</p>
+  <table>
+    <tr><th>Target sustained throughput</th><th>Parser <code>max_concurrency</code></th><th><code>BACKFILL_RATE</code> (file/min)</th><th>Risk</th></tr>
+    <tr><td>~65K lines/s</td><td><code>10</code> (default)</td><td><code>60</code></td><td>None &mdash; current default</td></tr>
+    <tr><td>~85K lines/s</td><td><code>14</code></td><td><code>60</code></td><td>Low &mdash; extra Parser invocations only</td></tr>
+    <tr><td>~100K lines/s</td><td><code>16&ndash;18</code></td><td><code>60&ndash;80</code></td><td>Low &mdash; well under platform 250 limit</td></tr>
+  </table>
+  <div class="warn">
+    Do <strong>not</strong> raise Sender <code>max_concurrency</code> above 20 or shorten <code>MIN_SENDER_INVOCATION_MS</code> below 200. Both would exceed the receiver's tested capacity and may impact the production worker on the same endpoint.
+  </div>
+  <p>For large raw files, parse queue is intentionally configured as <code>max_batch_size = 1</code>, so each large gzip file gets its own invocation instead of sharing CPU time with two other large files.</p>
 
   <h2>Monitoring</h2>
   <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill</code></pre>
-  <p>The default <code>/backfill/status</code> response is human-friendly and includes:</p>
-  <ul>
-    <li><code>summary</code>: a plain-language one-line description</li>
-    <li><code>status_code</code> and <code>stage_code</code>, each with its own explanation field</li>
-    <li><code>delivery_completed</code>: whether all batches have been sent</li>
-    <li><code>fully_completed</code>: whether the replay is truly finished, including cleanup</li>
-    <li>matched raw file count, sent batch count, sent log line count, pending counts, and batch-size distribution</li>
-    <li>Beijing-time timestamps only, plus a note explaining that the R2 Dashboard “Date Created” is not the right signal for the latest run state</li>
-  </ul>
+  <p>The default <code>/backfill/status</code> response is human-friendly. Key fields:</p>
+  <table>
+    <tr><th>Field</th><th>Meaning</th></tr>
+    <tr><td><code>summary</code></td><td>One-line plain-language status</td></tr>
+    <tr><td><code>stage_code</code></td><td><code>scanning_and_queueing</code> / <code>sending</code> / <code>sent_waiting_cleanup</code> / <code>cleaned</code></td></tr>
+    <tr><td><code>delivery_completed</code></td><td><code>true</code> when <code>batches_pending == 0</code> and all batches sent</td></tr>
+    <tr><td><code>fully_completed</code></td><td><code>true</code> only after temporary files are also cleaned</td></tr>
+    <tr><td><code>matched_raw_files</code></td><td>Total raw files matched in the time window</td></tr>
+    <tr><td><code>batches_sent</code> / <code>batches_pending</code></td><td>Sent vs pending batch count</td></tr>
+    <tr><td><code>log_lines_sent</code></td><td>Total lines delivered to the receiver</td></tr>
+    <tr><td><code>batch_lines_avg</code> / <code>_min</code> / <code>_max</code></td><td>Distribution of batch sizes (lines per POST)</td></tr>
+    <tr><td><code>replay_window_beijing</code></td><td>Replay window in Beijing time</td></tr>
+    <tr><td><code>last_refresh_beijing</code></td><td>Last status update time</td></tr>
+  </table>
   <p>The same human-friendly payload is also written to <code>cdn-logs-raw/backfill-state/status.json</code> so you can inspect it directly in the R2 UI. Use <code>GET /backfill/status?view=raw</code> if you want the raw state document plus low-level artifact stats.</p>
 
+  <h2>Cleanup Lifecycle</h2>
+  <p>After all batches are delivered:</p>
+  <ol>
+    <li><code>inspectRunArtifacts</code> &mdash; list every batch artifact and verify <code>.done</code> exists</li>
+    <li><code>cleanup.status = ready</code> &mdash; entered when all artifacts confirmed sent</li>
+    <li><strong>24-hour grace period</strong> &mdash; temporary files retained for inspection</li>
+    <li><code>cleanup.status = deleting</code> &mdash; bulk delete <code>processed-backfill/&lt;run-id&gt;/*</code></li>
+    <li><code>cleanup.status = done</code> &mdash; state marked <code>cleaned</code>, run is fully complete</li>
+  </ol>
+  <p>The grace period is intentional: it gives operators a window to inspect what was sent before files are removed.</p>
+
+  <h2>Re-running the Same Time Window</h2>
+  <p>If you need to replay the exact same <code>[A, B]</code> window after a successful run:</p>
+  <pre><code># 1. Delete state files
+wrangler r2 object delete cdn-logs-raw/backfill-state/progress.json
+wrangler r2 object delete cdn-logs-raw/backfill-state/status.json
+
+# 2. Either redeploy, or wait for the next cron tick (BACKFILL_ENABLED stays "true")</code></pre>
+  <p>Old <code>processed-backfill/&lt;run-id&gt;/</code> prefixes do <strong>not</strong> block a fresh run &mdash; each run uses a new <code>run_id</code> (timestamp-suffixed).</p>
+
   <h2>Finished?</h2>
-  <p>The safest completion rule is:</p>
+  <p>The safest completion rule:</p>
   <ul>
-    <li><code>/backfill/status</code> shows <code>status = done</code> or <code>cleaned</code></li>
-    <li><code>send-queue-backfill</code> backlog is zero</li>
+    <li><code>/backfill/status</code> shows <code>fully_completed = true</code></li>
+    <li><code>send-queue-backfill</code> backlog is zero (visible in the Cloudflare Dashboard)</li>
   </ul>
 </body>
 </html>
