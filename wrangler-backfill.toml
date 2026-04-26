@@ -7,9 +7,9 @@
 #   - 独立 queues: parse-queue-backfill / send-queue-backfill (含各自 DLQ)
 #   - 独立 R2 前缀: processed-backfill/<run-id>/ (生产写 processed/)
 #   - 共享 R2 bucket: cdn-logs-raw (对 raw 文件 logs/... 只读)
-#   - Sender 限速双层保证：max_concurrency=10, max_batch_size=1 (config 层)
+#   - Sender 限速双层保证：max_concurrency=20, max_batch_size=1 (config 层)
 #     + handleSendQueue 内 200ms/invocation throttle (code 层)
-#     → 当前 checked-in 配置的理论硬上限：≤ 50 batch/s = ≤ 50,000 lines/s
+#     → 当前 checked-in 配置的理论硬上限：≤ 100 batch/s = ≤ 100,000 lines/s
 #
 # 一次性部署流程（见 README.md）：
 #   1. 改 account_id 和 BACKFILL_START/END_TIME
@@ -33,14 +33,6 @@ preview_urls         = false
 binding     = "RAW_BUCKET"
 bucket_name = "cdn-logs-raw"
 
-[[durable_objects.bindings]]
-name       = "RUN_AGGREGATOR"
-class_name = "RunAggregator"
-
-[[migrations]]
-tag = "v1-run-aggregator"
-new_sqlite_classes = ["RunAggregator"]
-
 # ─── Queue 生产者 ─────────────────────────────────────────────────────────────
 [[queues.producers]]
 binding = "PARSE_QUEUE"
@@ -51,7 +43,8 @@ binding = "SEND_QUEUE"
 queue   = "send-queue-backfill"
 
 # ─── Queue 消费者 ─────────────────────────────────────────────────────────────
-# Parser queue: 允许并发解析 raw file；跨文件聚合与幂等由 RunAggregator Durable Object 负责
+# Parser queue: 直接按 raw file 独立解析并切 batch。
+# parse 端可以积极一些，因为真正对客户接收端施压的是 sender cap。
 [[queues.consumers]]
 queue              = "parse-queue-backfill"
 max_batch_size     = 3
@@ -62,15 +55,15 @@ retry_delay        = 30
 dead_letter_queue  = "parse-dlq-backfill"
 
 # ⭐ Sender queue: 关键限速点（对接收端的实际冲击速率）
-# max_batch_size=1 每批 1 条 send
+# max_batch_size=1: 每个 invocation 只发 1 个 POST，便于客户侧限速与对账
 # 代码层 MIN_SENDER_INVOCATION_MS=200 节流 (src/index.js) → 每 invocation 至少 200ms
-# 组合效果：max_concurrency=10 时，理论硬上限为 ≤ 50 batch/s = ≤ 50,000 行/s
+# 组合效果：max_concurrency=20 时，理论硬上限为 ≤ 100 batch/s = ≤ 100,000 行/s
 # retry_delay=30 失败时等 30s 再试 → 保护接收端不被重试风暴
 [[queues.consumers]]
 queue              = "send-queue-backfill"
 max_batch_size     = 1
 max_batch_timeout  = 5
-max_concurrency    = 10
+max_concurrency    = 20
 max_retries        = 5
 retry_delay        = 30
 dead_letter_queue  = "send-dlq-backfill"
@@ -84,7 +77,7 @@ dead_letter_queue  = "send-dlq-backfill"
 # 约束：
 #   - START 必须早于 END
 #   - END 必须 ≤ 现在（不能是未来）
-#   - 范围最大 48 小时（防误操作）
+#   - 轻量版默认允许最大 7 天范围；更大范围请分多次补传
 #   - Enqueue 阶段按“文件时间范围与 [A,B] 有交集”筛选 raw file
 #   - Parser 阶段再按记录时间逐条裁切，只发送窗口内的日志行
 BACKFILL_START_TIME = "2026-04-25T10:40:00+08:00"
@@ -92,14 +85,14 @@ BACKFILL_END_TIME   = "2026-04-25T11:00:00+08:00"
 
 # ==== Producer 端速率 ====
 # 每次 Cron（每分钟）最多入队 raw files 数量
-# 当前示例 20: 每分钟入 20 个 raw file
-# Consumer 端的 max_concurrency=10 + max_batch_size=1 + MIN_SENDER_INVOCATION_MS=200 是真正决定接收端冲击速率的参数
+# 默认示例 100: 每分钟最多入 100 个 raw file
+# Consumer 端的 max_concurrency=20 + max_batch_size=1 + MIN_SENDER_INVOCATION_MS=200 是真正决定接收端冲击速率的参数
 # 加大 Producer rate 只会增加 send-queue-backfill 瞬时积压（CF Queue 100K 容量内安全）
-# 补传总时长 ≥ 总 batches ÷ 5 batch/s（上限估算，实际若接收端慢会更长）
-BACKFILL_RATE = "20"
+# 补传总时长 ≥ 总 batches ÷ 100 batch/s（满 1000-line batch 且客户 ACK <200ms 时的上限估算）
+BACKFILL_RATE = "100"
 
 # ==== 可选开关 ====
-BACKFILL_ENABLED = "true"        # 已重新启用：从干净状态启动一次全新验证 run
+BACKFILL_ENABLED = "true"        # 当前直接启用，用于验证指定时间窗回放
 
 # ==== 其他参数 ====
 # 下面 queue/bucket 名字需和本文件 [[queues.*]] / [[r2_buckets]] 的定义一致

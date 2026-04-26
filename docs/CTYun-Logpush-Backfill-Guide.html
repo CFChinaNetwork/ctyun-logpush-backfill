@@ -1,317 +1,104 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CTYun Logpush Backfill Guide</title>
-<style>
-:root {
-  --orange: #f48120;
-  --dark: #1a1a2e;
-  --darker: #16213e;
-  --card: #0f3460;
-  --text: #e6e6e6;
-  --muted: #a8a8b3;
-  --border: rgba(255,255,255,0.1);
-  --code-bg: #0d1117;
-  --green: #00d084;
-  --yellow: #ffd166;
-  --blue: #54a0ff;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background: var(--dark);
-  color: var(--text);
-  line-height: 1.75;
-  font-size: 15px;
-}
-header {
-  background: linear-gradient(135deg, #0f3460 0%, #16213e 45%, #1a1a2e 100%);
-  border-bottom: 3px solid var(--orange);
-  padding: 48px 32px 36px;
-  text-align: center;
-}
-.badge {
-  display: inline-block;
-  background: var(--orange);
-  color: #fff;
-  border-radius: 999px;
-  padding: 4px 14px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 1.5px;
-  margin-bottom: 16px;
-}
-header h1 { font-size: 30px; margin-bottom: 10px; }
-header p { color: #b4b4c2; max-width: 760px; margin: 0 auto; }
-nav {
-  background: var(--darker);
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  border-bottom: 1px solid var(--border);
-  padding: 0 20px;
-  display: flex;
-  gap: 2px;
-  overflow-x: auto;
-}
-nav a {
-  color: #c0c0ca;
-  text-decoration: none;
-  padding: 14px 16px;
-  font-size: 13px;
-  white-space: nowrap;
-}
-nav a:hover { color: var(--orange); }
-.container { max-width: 1080px; margin: 0 auto; padding: 36px 24px 72px; }
-.section { margin-bottom: 52px; }
-.title {
-  font-size: 23px;
-  border-left: 4px solid var(--orange);
-  padding-left: 14px;
-  margin-bottom: 22px;
-}
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 22px;
-  margin-bottom: 18px;
-}
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 16px;
-}
-.info h3 { color: var(--orange); font-size: 14px; margin-bottom: 8px; }
-.info p { color: var(--muted); font-size: 14px; }
-p { margin-bottom: 12px; }
-ul, ol { padding-left: 20px; margin: 8px 0 14px; }
-li { margin: 6px 0; }
-pre {
-  background: var(--code-bg);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 10px;
-  padding: 16px 18px;
-  overflow-x: auto;
-  color: #d7e3f4;
-  font-size: 13px;
-  line-height: 1.65;
-  margin: 12px 0 18px;
-}
-code {
-  background: rgba(255,255,255,0.08);
-  color: #ffd39a;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-pre code { background: none; color: inherit; padding: 0; }
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-  margin: 14px 0 20px;
-}
-th {
-  background: rgba(244,129,32,0.14);
-  color: var(--orange);
-  text-align: left;
-  padding: 10px 12px;
-  border-bottom: 1px solid rgba(244,129,32,0.3);
-}
-td {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
-}
-.tip {
-  border-left: 3px solid var(--blue);
-  background: rgba(84,160,255,0.08);
-  padding: 12px 14px;
-  border-radius: 8px;
-  margin: 12px 0;
-}
-.warn {
-  border-left-color: var(--yellow);
-  background: rgba(255,209,102,0.09);
-}
-.ok {
-  border-left-color: var(--green);
-  background: rgba(0,208,132,0.09);
-}
-footer {
-  border-top: 1px solid var(--border);
-  color: #888;
-  text-align: center;
-  padding: 28px;
-  font-size: 12px;
-}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CTYun Logpush Backfill Guide</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; line-height: 1.6; color: #1f2937; }
+    h1, h2 { color: #111827; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { background: #111827; color: #f9fafb; padding: 16px; border-radius: 10px; overflow-x: auto; }
+    .note { background: #f3f4f6; padding: 14px 16px; border-radius: 10px; }
+    .warn { background: #fff7ed; padding: 14px 16px; border-radius: 10px; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; text-align: left; vertical-align: top; }
+  </style>
 </head>
 <body>
-<header>
-  <div class="badge">Cloudflare Worker Guide</div>
   <h1>CTYun Logpush Backfill Guide</h1>
-  <p>Use this standalone Worker when the customer missed a historical slice of logs and needs a controlled replay from the original Logpush files stored in R2.</p>
-</header>
+  <p>This is the final lightweight backfill design. It replays historical R2 logs inside a precise time window, drops Worker subrequests, transforms each record to the CTYun partner format, and sends batches to the customer endpoint with explicit rate control.</p>
 
-<nav>
-  <a href="#overview">Overview</a>
-  <a href="#deploy">Deploy</a>
-  <a href="#monitor">Monitor</a>
-  <a href="#tuning">Tuning</a>
-  <a href="#cleanup">Cleanup</a>
-  <a href="#faq">FAQ</a>
-</nav>
+  <h2>Architecture</h2>
+  <pre><code>R2 logs/
+-> parse-queue-backfill
+-> Parser
+-> processed-backfill/&lt;run-id&gt;/
+-> send-queue-backfill
+-> Sender
+-> customer endpoint</code></pre>
+  <div class="note">
+    <strong>No Durable Object is used in the hot path.</strong> Each raw file is parsed independently and written into final batch files directly.
+  </div>
 
-<div class="container">
-  <section class="section" id="overview">
-    <h2 class="title">Overview</h2>
-    <div class="grid">
-      <div class="card info"><h3>Use case</h3><p>Replay only the historical records inside a precise time window <code>[A, B]</code>.</p></div>
-      <div class="card info"><h3>Isolation</h3><p>The backfill Worker uses its own Worker name, Queues, and <code>processed-backfill/&lt;run-id&gt;/</code> prefix.</p></div>
-      <div class="card info"><h3>Shared endpoint</h3><p>The customer ingestion endpoint is still shared with production, so the sender rate should be tuned carefully.</p></div>
-      <div class="card info"><h3>Request filter</h3><p>Only top-level requests are sent: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code>.</p></div>
-      <div class="card info"><h3>Auto-cleanup</h3><p>After a successful run, temporary batch artifacts are automatically removed from R2 after a long safety delay.</p></div>
-    </div>
+  <h2>What It Guarantees</h2>
+  <ul>
+    <li>Precise replay inside <code>[BACKFILL_START_TIME, BACKFILL_END_TIME]</code></li>
+    <li>Only top-level requests are forwarded: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code></li>
+    <li>Authenticated POSTs using the same CTYun secrets as production</li>
+    <li>Sender-side rate cap through queue concurrency + a 200ms per-invocation floor</li>
+    <li>Temporary batch files are cleaned automatically after the run completes</li>
+  </ul>
 
-    <div class="card">
-      <p>Pipeline:</p>
-      <pre><code>R2 logs/ -> parse-queue-backfill -> Parser
-        -> RunAggregator Durable Object
-        -> processed-backfill/&lt;run-id&gt;/
-        -> send-queue-backfill -> Sender -> customer endpoint</code></pre>
-      <p>The Worker reads only from <code>logs/</code>. It does not modify the customer's original raw logs. The parser decompresses line-by-line and keeps only top-level requests.</p>
-    </div>
-  </section>
+  <h2>Delivery Semantics</h2>
+  <div class="warn">
+    <strong>Important:</strong> this pipeline is <strong>at-least-once</strong>, not exactly-once.
+    If a customer POST succeeds but the Worker cannot persist the <code>.done</code> marker afterward,
+    the batch will be retried. If the receiver requires strict exactly-once behavior, dedupe by batch identity on the receiver side.
+  </div>
 
-  <section class="section" id="deploy">
-    <h2 class="title">Deploy</h2>
-    <div class="card">
-      <p>Before deployment, make sure these values are set correctly:</p>
-      <table>
-        <tr><th>Field</th><th>Meaning</th></tr>
-        <tr><td><code>RUN_AGGREGATOR</code></td><td>Durable Object binding used to aggregate lines across raw files and fill batches.</td></tr>
-        <tr><td><code>BACKFILL_START_TIME</code></td><td>Required replay start time in ISO 8601.</td></tr>
-        <tr><td><code>BACKFILL_END_TIME</code></td><td>Required replay end time in ISO 8601 and must be <= now.</td></tr>
-        <tr><td><code>BACKFILL_ENABLED</code></td><td>Recommended to stay <code>false</code> by default. Set to <code>true</code> only when you are ready to run the replay.</td></tr>
-        <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files are scanned per cron minute. Current example: <code>20</code>.</td></tr>
-        <tr><td><code>SEND_TIMEOUT_MS</code></td><td>How long the sender waits for the customer ACK before retrying.</td></tr>
-        <tr><td><code>BATCH_SIZE</code></td><td>How many log lines are packed into one HTTP POST at most.</td></tr>
-      </table>
-      <p>One-time queue setup:</p>
-      <pre><code>wrangler queues create parse-queue-backfill
+  <h2>Deploy</h2>
+  <table>
+    <tr><th>Field</th><th>Meaning</th></tr>
+    <tr><td><code>BACKFILL_START_TIME</code></td><td>Replay start time in ISO 8601</td></tr>
+    <tr><td><code>BACKFILL_END_TIME</code></td><td>Replay end time in ISO 8601. Must be in the past.</td></tr>
+    <tr><td><code>BACKFILL_ENABLED</code></td><td>Must be set to <code>true</code> to run. The checked-in default is <code>false</code>.</td></tr>
+    <tr><td><code>BACKFILL_RATE</code></td><td>How many raw files cron can enqueue per minute.</td></tr>
+    <tr><td><code>BATCH_SIZE</code></td><td>Maximum lines per POST. Default <code>1000</code>.</td></tr>
+    <tr><td><code>SEND_TIMEOUT_MS</code></td><td>How long sender waits for a customer ACK before retrying.</td></tr>
+  </table>
+
+  <pre><code>wrangler queues create parse-queue-backfill
 wrangler queues create send-queue-backfill
 wrangler queues create parse-dlq-backfill
-wrangler queues create send-dlq-backfill</code></pre>
-      <p>Set the three secrets:</p>
-      <pre><code>wrangler secret put CTYUN_ENDPOINT --config wrangler-backfill.toml
+wrangler queues create send-dlq-backfill
+
+wrangler secret put CTYUN_ENDPOINT --config wrangler-backfill.toml
 wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
-wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml</code></pre>
-      <p>Deploy:</p>
-      <pre><code>wrangler deploy --config wrangler-backfill.toml</code></pre>
-      <p>No extra manual setup is required for the Durable Object. Wrangler provisions it automatically through the configured migration.</p>
-      <p>Do not change the replay window while a previous run is still active. Wait until <code>/backfill/status</code> shows <code>status = "cleaned"</code> before changing <code>BACKFILL_START_TIME</code> / <code>BACKFILL_END_TIME</code>.</p>
-    </div>
-  </section>
+wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 
-  <section class="section" id="monitor">
-    <h2 class="title">Monitor</h2>
-    <div class="card">
-      <p>The two most useful commands are:</p>
-      <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
+wrangler deploy --config wrangler-backfill.toml</code></pre>
+
+  <h2>Tuning</h2>
+  <p>Current checked-in sender ceiling:</p>
+  <pre><code>max_concurrency = 20
+max_batch_size = 1
+MIN_SENDER_INVOCATION_MS = 200
+BATCH_SIZE = 1000
+
+theoretical ceiling
+= 20 * 1 * (1000 / 200) * 1000
+= 100,000 lines/s</code></pre>
+  <p>That ceiling assumes batches are close to 1000 lines and customer ACK stays under 200ms.</p>
+
+  <table>
+    <tr><th>Target ceiling</th><th>Suggested sender max_concurrency</th></tr>
+    <tr><td>10,000 lines/s</td><td><code>2</code></td></tr>
+    <tr><td>20,000 lines/s</td><td><code>4</code></td></tr>
+    <tr><td>50,000 lines/s</td><td><code>10</code></td></tr>
+    <tr><td>100,000 lines/s</td><td><code>20</code></td></tr>
+  </table>
+
+  <h2>Monitoring</h2>
+  <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill</code></pre>
-      <p>For the original internal state document, use <code>/backfill/status?view=raw</code>.</p>
-      <table>
-        <tr><th>Field</th><th>Meaning</th></tr>
-        <tr><td><code>status</code></td><td>High-level lifecycle: <code>running</code>, <code>done</code>, or <code>cleaned</code>.</td></tr>
-        <tr><td><code>stage</code></td><td>Human-readable current step, such as scanning raw logs or handing batches to the sender queue.</td></tr>
-        <tr><td><code>message</code></td><td>Short sentence you can forward directly to the customer.</td></tr>
-        <tr><td><code>window_start</code> / <code>window_end</code></td><td>The exact replay time window for this run.</td></tr>
-        <tr><td><code>raw_files_enqueued</code></td><td>How many raw <code>.log.gz</code> files matched the requested window.</td></tr>
-        <tr><td><code>batches_handed_to_send_queue</code></td><td>Exact number of batch files the Durable Object has written and handed to <code>send-queue-backfill</code>.</td></tr>
-        <tr><td><code>log_lines_handed_to_send_queue</code></td><td>Exact total log lines across those emitted batches. Use this as the primary reconciliation number.</td></tr>
-        <tr><td><code>line_count_status</code></td><td><code>exact</code> means the total above is exact; <code>not_available_for_legacy_run</code> means the run started before per-batch line counting existed.</td></tr>
-        <tr><td><code>average_lines_per_batch</code></td><td>Average lines per emitted batch. This is only a convenience view; the exact total is still <code>log_lines_handed_to_send_queue</code>.</td></tr>
-        <tr><td><code>smallest_batch_lines</code> / <code>largest_batch_lines</code></td><td>Smallest and largest emitted batch size seen so far.</td></tr>
-        <tr><td><code>batches_still_buffered_in_worker</code> / <code>lines_still_buffered_in_worker</code></td><td>How many batches or lines are still buffered inside the Durable Object and not yet flushed into send-queue.</td></tr>
-      </table>
-      <div class="tip">
-        Attempt-level ACK and queue-wait metrics are intentionally no longer persisted. Retries, late duplicates, and timeout ambiguity made them poor "source of truth" counters for customer-side reconciliation.
-      </div>
-      <div class="tip ok">
-        For sender health, use Worker logs plus the Queue backlog view. For exact worker-side handoff volume, rely on <code>batches_handed_to_send_queue</code> and <code>log_lines_handed_to_send_queue</code>.
-      </div>
-      <div class="tip warn">
-        If you deploy this version in the middle of an older in-flight run, <code>aggregate.line_count_tracking</code> can show <code>unavailable_legacy_run</code>. That means older batches were created before per-batch line totals existed, so exact totals are only available for runs that start on this version.
-      </div>
-    </div>
-  </section>
+  <p>Use queue backlog plus sender logs as the operational source of truth. Sender logs include <code>ack_ms</code> and <code>queue_wait_ms</code>.</p>
 
-  <section class="section" id="tuning">
-    <h2 class="title">Tuning</h2>
-    <div class="card">
-      <p>Current checked-in sender cap mapping:</p>
-      <table>
-        <tr><th>Parameter</th><th>Plain meaning</th></tr>
-        <tr><td><code>BATCH_SIZE = 1000</code></td><td>Each HTTP POST can carry up to <code>1000</code> log lines.</td></tr>
-        <tr><td><code>max_concurrency = 10</code></td><td>Up to <code>10</code> sender invocations can run at the same time.</td></tr>
-        <tr><td><code>max_batch_size = 1</code></td><td>Each sender invocation handles only <code>1</code> send-queue message, which is effectively one POST.</td></tr>
-        <tr><td><code>MIN_SENDER_INVOCATION_MS = 200</code></td><td>Each sender invocation takes at least <code>200ms</code>, which caps the sender at <code>5</code> sends per second.</td></tr>
-      </table>
-      <pre><code>lines/s cap
-= max_concurrency × max_batch_size × (1000 / MIN_SENDER_INVOCATION_MS) × BATCH_SIZE
-= 10 × 1 × 5 × 1000
-= 50000 lines/s</code></pre>
-      <p>Actual speed can still be lower if the customer ACK is slower than 200ms, but this configuration defines the current theoretical ceiling.</p>
-      <div class="tip warn">
-        Recommended tuning order: first increase sender <code>max_concurrency</code> gradually while keeping <code>max_batch_size = 1</code>; only change <code>max_batch_size</code> later if the endpoint has already proven it can handle the extra in-flight POSTs.
-      </div>
-      <table>
-        <tr><th>Target ceiling</th><th>Suggested setting</th><th>Comment</th></tr>
-        <tr><td>5,000 lines/s</td><td><code>max_concurrency = 1</code></td><td>Lowest pressure on the customer endpoint.</td></tr>
-        <tr><td>10,000 lines/s</td><td><code>max_concurrency = 2</code></td><td>Good first step when ACK stays in the low hundreds of milliseconds.</td></tr>
-        <tr><td>20,000 lines/s</td><td><code>max_concurrency = 4</code></td><td>Still easy to reason about because one invocation = one POST.</td></tr>
-        <tr><td>30,000 lines/s</td><td><code>max_concurrency = 6</code></td><td>Watch Queue backlog and customer-side ingest closely.</td></tr>
-        <tr><td>40,000 lines/s</td><td><code>max_concurrency = 8</code></td><td>Use only after the endpoint has stayed stable at 30k.</td></tr>
-        <tr><td>50,000 lines/s</td><td><code>max_concurrency = 10</code></td><td>Current checked-in example.</td></tr>
-      </table>
-      <p>Raising <code>BACKFILL_RATE</code> only feeds raw files into the parser faster. It does not change the final sender ceiling.</p>
-    </div>
-  </section>
-
-  <section class="section" id="cleanup">
-    <h2 class="title">Cleanup</h2>
-    <div class="card">
-      <p>After a successful run, the Worker automatically removes the temporary artifacts after a safety delay of about 1 day:</p>
-      <ul>
-        <li>All temporary artifacts under <code>processed-backfill/&lt;run-id&gt;/</code></li>
-        <li>Legacy <code>backfill-state/send-stats.json</code>, if it exists from an older deployment</li>
-      </ul>
-      <p>The Worker keeps only a tiny <code>backfill-state/progress.json</code> completion marker while the Worker is still deployed. This prevents the same config from replaying again automatically.</p>
-      <div class="tip">
-        Once the backfill Worker is no longer needed, delete the Worker and then remove the tiny progress marker if you want the bucket to contain only the customer's raw logs.
-      </div>
-    </div>
-  </section>
-
-  <section class="section" id="faq">
-    <h2 class="title">FAQ</h2>
-    <div class="card">
-      <p><strong>Does backfill affect production?</strong></p>
-      <p>It does not share production Queues or processed prefixes, so it cannot corrupt the production CF pipeline. It still POSTs to the same customer endpoint, so it adds controlled backfill traffic there.</p>
-      <p><strong>How do I know backfill is truly finished?</strong></p>
-      <p>The safest rule is: <code>/backfill/status</code> shows <code>status = done/cleaned</code> and the <code>send-queue-backfill</code> backlog is zero.</p>
-      <p><strong>What if the customer ACK is slow?</strong></p>
-      <p>Increase <code>SEND_TIMEOUT_MS</code> first. That reduces the chance of retrying a POST that the customer actually received but acknowledged late.</p>
-    </div>
-  </section>
-</div>
-
-<footer>
-  CTYun Logpush Backfill Guide · Cloudflare China Network
-</footer>
+  <h2>Finished?</h2>
+  <p>The safest completion rule is:</p>
+  <ul>
+    <li><code>/backfill/status</code> shows <code>status = done</code> or <code>cleaned</code></li>
+    <li><code>send-queue-backfill</code> backlog is zero</li>
+  </ul>
 </body>
 </html>

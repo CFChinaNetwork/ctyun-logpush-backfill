@@ -1,322 +1,105 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>天翼云历史日志补传指南</title>
-<style>
-:root {
-  --orange: #f48120;
-  --dark: #1a1a2e;
-  --darker: #16213e;
-  --card: #0f3460;
-  --text: #e6e6e6;
-  --muted: #a8a8b3;
-  --border: rgba(255,255,255,0.1);
-  --code-bg: #0d1117;
-  --green: #00d084;
-  --yellow: #ffd166;
-  --blue: #54a0ff;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
-  background: var(--dark);
-  color: var(--text);
-  line-height: 1.75;
-  font-size: 15px;
-}
-header {
-  background: linear-gradient(135deg, #0f3460 0%, #16213e 45%, #1a1a2e 100%);
-  border-bottom: 3px solid var(--orange);
-  padding: 48px 32px 36px;
-  text-align: center;
-}
-.badge {
-  display: inline-block;
-  background: var(--orange);
-  color: #fff;
-  border-radius: 999px;
-  padding: 4px 14px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 1.5px;
-  margin-bottom: 16px;
-}
-header h1 { font-size: 30px; margin-bottom: 10px; }
-header p { color: #b4b4c2; max-width: 760px; margin: 0 auto; }
-nav {
-  background: var(--darker);
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  border-bottom: 1px solid var(--border);
-  padding: 0 20px;
-  display: flex;
-  gap: 2px;
-  overflow-x: auto;
-}
-nav a {
-  color: #c0c0ca;
-  text-decoration: none;
-  padding: 14px 16px;
-  font-size: 13px;
-  white-space: nowrap;
-}
-nav a:hover { color: var(--orange); }
-.container { max-width: 1080px; margin: 0 auto; padding: 36px 24px 72px; }
-.section { margin-bottom: 52px; }
-.title {
-  font-size: 23px;
-  border-left: 4px solid var(--orange);
-  padding-left: 14px;
-  margin-bottom: 22px;
-}
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 22px;
-  margin-bottom: 18px;
-}
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 16px;
-}
-.info h3 { color: var(--orange); font-size: 14px; margin-bottom: 8px; }
-.info p { color: var(--muted); font-size: 14px; }
-p { margin-bottom: 12px; }
-ul, ol { padding-left: 20px; margin: 8px 0 14px; }
-li { margin: 6px 0; }
-pre {
-  background: var(--code-bg);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 10px;
-  padding: 16px 18px;
-  overflow-x: auto;
-  color: #d7e3f4;
-  font-size: 13px;
-  line-height: 1.65;
-  margin: 12px 0 18px;
-}
-code {
-  background: rgba(255,255,255,0.08);
-  color: #ffd39a;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-pre code { background: none; color: inherit; padding: 0; }
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-  margin: 14px 0 20px;
-}
-th {
-  background: rgba(244,129,32,0.14);
-  color: var(--orange);
-  text-align: left;
-  padding: 10px 12px;
-  border-bottom: 1px solid rgba(244,129,32,0.3);
-}
-td {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: top;
-}
-.tip {
-  border-left: 3px solid var(--blue);
-  background: rgba(84,160,255,0.08);
-  padding: 12px 14px;
-  border-radius: 8px;
-  margin: 12px 0;
-}
-.warn {
-  border-left-color: var(--yellow);
-  background: rgba(255,209,102,0.09);
-}
-.ok {
-  border-left-color: var(--green);
-  background: rgba(0,208,132,0.09);
-}
-footer {
-  border-top: 1px solid var(--border);
-  color: #888;
-  text-align: center;
-  padding: 28px;
-  font-size: 12px;
-}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>天翼云 Logpush Backfill 指南</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; line-height: 1.7; color: #1f2937; }
+    h1, h2 { color: #111827; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    pre { background: #111827; color: #f9fafb; padding: 16px; border-radius: 10px; overflow-x: auto; }
+    .note { background: #f3f4f6; padding: 14px 16px; border-radius: 10px; }
+    .warn { background: #fff7ed; padding: 14px 16px; border-radius: 10px; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: 10px 8px; text-align: left; vertical-align: top; }
+  </style>
 </head>
 <body>
-<header>
-  <div class="badge">Cloudflare Worker Guide</div>
-  <h1>天翼云历史日志补传指南</h1>
-  <p>适用于客户漏收一段历史日志时，使用独立 Backfill Worker 从 R2 原始日志中补传指定时间窗口的场景。</p>
-</header>
+  <h1>天翼云 Logpush Backfill 指南</h1>
+  <p>这是最终版轻量 backfill 方案。它会把指定时间窗内的 R2 历史日志重新取出，过滤 Worker 子请求，转换为天翼云要求的格式，并按明确限速发送到客户接收端。</p>
 
-<nav>
-  <a href="#overview">概述</a>
-  <a href="#deploy">部署</a>
-  <a href="#monitor">观察</a>
-  <a href="#tuning">调速</a>
-  <a href="#cleanup">清理</a>
-  <a href="#faq">FAQ</a>
-</nav>
+  <h2>架构</h2>
+  <pre><code>R2 logs/
+-> parse-queue-backfill
+-> Parser
+-> processed-backfill/&lt;run-id&gt;/
+-> send-queue-backfill
+-> Sender
+-> customer endpoint</code></pre>
+  <div class="note">
+    <strong>热路径里不再使用 Durable Object。</strong>
+    每个 raw 文件独立解析，并直接写成最终 batch 文件。
+  </div>
 
-<div class="container">
-  <section class="section" id="overview">
-    <h2 class="title">概述</h2>
-    <div class="grid">
-      <div class="card info"><h3>用途</h3><p>精确回放指定时间窗 <code>[A, B]</code> 内的历史日志，不影响生产 CF 内部链路。</p></div>
-      <div class="card info"><h3>共享资源</h3><p>Backfill 与生产共享同一个客户接收 endpoint，因此发送速率需要谨慎调节。</p></div>
-      <div class="card info"><h3>默认上限</h3><p>当前仓库配置的发送上限为 <code>&lt;= 50,000 行/秒</code>，实际速率仍取决于客户 ACK 时间与日志批次大小。</p></div>
-      <div class="card info"><h3>请求过滤</h3><p>仅处理父请求 / top-level requests：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code>。</p></div>
-      <div class="card info"><h3>自动清理</h3><p>成功完成后会在一个较长的安全等待期后自动清理 <code>processed-backfill/&lt;run-id&gt;/</code> 和发送统计文件，尽量不在客户 R2 留下尾巴。</p></div>
-    </div>
+  <h2>这套方案保证什么</h2>
+  <ul>
+    <li>精确回放 <code>[BACKFILL_START_TIME, BACKFILL_END_TIME]</code> 内的日志</li>
+    <li>只发送父请求：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code></li>
+    <li>使用和生产一致的 CTYun 鉴权 secrets 做 POST</li>
+    <li>通过 queue 并发 + 200ms invocation floor 对 sender 做显式限速</li>
+    <li>run 完成后自动清理临时 batch 文件</li>
+  </ul>
 
-    <div class="card">
-      <p>数据流转如下：</p>
-      <pre><code>R2 logs/ -> parse-queue-backfill -> Parser
-        -> RunAggregator Durable Object
-        -> processed-backfill/&lt;run-id&gt;/
-        -> send-queue-backfill -> Sender -> customer endpoint</code></pre>
-      <p>Backfill 只读取 <code>logs/</code> 下的原始 Logpush 文件，不会改动客户原始日志。Parser 会逐条解压并过滤掉 Workers 子请求，只保留父请求。</p>
-    </div>
-  </section>
+  <h2>投递语义</h2>
+  <div class="warn">
+    <strong>重要：</strong>这套方案是 <strong>at-least-once</strong>，不是 exactly-once。
+    如果客户 POST 已成功，但 Worker 随后没能写下 <code>.done</code> 标记，那么这个 batch 会被重试。
+    如果客户侧要求严格去重，需要按 batch identity 在接收端做 dedupe。
+  </div>
 
-  <section class="section" id="deploy">
-    <h2 class="title">部署</h2>
-    <div class="card">
-      <p>部署前，客户只需要确认这几个值：</p>
-      <table>
-        <tr><th>字段</th><th>含义</th></tr>
-        <tr><td><code>RUN_AGGREGATOR</code></td><td>Durable Object 绑定，用于跨多个 raw 文件聚合日志行并凑满 batch。</td></tr>
-        <tr><td><code>BACKFILL_START_TIME</code></td><td>补传开始时间，ISO 8601 格式</td></tr>
-        <tr><td><code>BACKFILL_END_TIME</code></td><td>补传结束时间，必须小于等于当前时间</td></tr>
-        <tr><td><code>BACKFILL_ENABLED</code></td><td>默认建议保持 <code>false</code>，确认配置无误后再改成 <code>true</code>。</td></tr>
-        <tr><td><code>BACKFILL_RATE</code></td><td>每分钟扫描多少个 raw 文件，当前示例值 <code>20</code></td></tr>
-        <tr><td><code>SEND_TIMEOUT_MS</code></td><td>等待客户 ACK 的最长时间，默认 <code>300000</code></td></tr>
-        <tr><td><code>BATCH_SIZE</code></td><td>每次 POST 最多带多少条日志，默认 <code>1000</code></td></tr>
-      </table>
-      <p>一次性初始化：</p>
-      <pre><code>wrangler queues create parse-queue-backfill
+  <h2>部署</h2>
+  <table>
+    <tr><th>字段</th><th>含义</th></tr>
+    <tr><td><code>BACKFILL_START_TIME</code></td><td>补传开始时间，ISO 8601</td></tr>
+    <tr><td><code>BACKFILL_END_TIME</code></td><td>补传结束时间，ISO 8601，且必须是过去时间</td></tr>
+    <tr><td><code>BACKFILL_ENABLED</code></td><td>必须显式设成 <code>true</code> 才会运行；checked-in 默认值是 <code>false</code></td></tr>
+    <tr><td><code>BACKFILL_RATE</code></td><td>每分钟最多 enqueue 多少个 raw 文件</td></tr>
+    <tr><td><code>BATCH_SIZE</code></td><td>每次 POST 最多多少条日志，默认 <code>1000</code></td></tr>
+    <tr><td><code>SEND_TIMEOUT_MS</code></td><td>sender 等客户 ACK 的最长时间</td></tr>
+  </table>
+
+  <pre><code>wrangler queues create parse-queue-backfill
 wrangler queues create send-queue-backfill
 wrangler queues create parse-dlq-backfill
 wrangler queues create send-dlq-backfill
 
 wrangler secret put CTYUN_ENDPOINT --config wrangler-backfill.toml
 wrangler secret put CTYUN_PRIVATE_KEY --config wrangler-backfill.toml
-wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml</code></pre>
-      <p>部署：</p>
-      <pre><code>wrangler deploy --config wrangler-backfill.toml</code></pre>
-      <p>Durable Object 不需要额外手工创建，Wrangler 会按配置中的 migration 自动完成。</p>
-      <p>如果上一个 run 还没结束，请不要直接改时间窗重跑。必须等 <code>/backfill/status</code> 里的 <code>status = "cleaned"</code> 后，再改 <code>BACKFILL_START_TIME</code> / <code>BACKFILL_END_TIME</code>。</p>
-    </div>
-  </section>
+wrangler secret put CTYUN_URI_EDGE --config wrangler-backfill.toml
 
-  <section class="section" id="monitor">
-    <h2 class="title">观察</h2>
-    <div class="card">
-      <p>最常用的两个观察入口：</p>
-      <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
+wrangler deploy --config wrangler-backfill.toml</code></pre>
+
+  <h2>调速</h2>
+  <p>当前 checked-in 的 sender 理论 ceiling：</p>
+  <pre><code>max_concurrency = 20
+max_batch_size = 1
+MIN_SENDER_INVOCATION_MS = 200
+BATCH_SIZE = 1000
+
+理论上限
+= 20 * 1 * (1000 / 200) * 1000
+= 100,000 行/秒</code></pre>
+  <p>这个上限默认假设 batch 接近 1000 行，且客户 ACK 小于 200ms。</p>
+
+  <table>
+    <tr><th>目标 ceiling</th><th>推荐 sender max_concurrency</th></tr>
+    <tr><td>10,000 行/秒</td><td><code>2</code></td></tr>
+    <tr><td>20,000 行/秒</td><td><code>4</code></td></tr>
+    <tr><td>50,000 行/秒</td><td><code>10</code></td></tr>
+    <tr><td>100,000 行/秒</td><td><code>20</code></td></tr>
+  </table>
+
+  <h2>观察</h2>
+  <pre><code>curl https://ctyun-logpush-backfill.&lt;your-subdomain&gt;.workers.dev/backfill/status
 wrangler tail ctyun-logpush-backfill</code></pre>
-      <p>如果要看原始内部状态文件，可以访问 <code>/backfill/status?view=raw</code>。</p>
-      <table>
-        <tr><th>字段</th><th>怎么理解</th></tr>
-        <tr><td><code>status</code></td><td>整体生命周期状态：<code>running</code>、<code>done</code>、<code>cleaned</code>。</td></tr>
-        <tr><td><code>stage</code></td><td>当前所处步骤的直白描述，例如还在扫 raw 文件，或者还在把 batch 交给 sender queue。</td></tr>
-        <tr><td><code>message</code></td><td>可以直接转发给客户看的简短说明。</td></tr>
-        <tr><td><code>window_start</code> / <code>window_end</code></td><td>这次补传的精确时间窗。</td></tr>
-        <tr><td><code>raw_files_enqueued</code></td><td>命中的 raw <code>.log.gz</code> 文件数量，不是日志条数。</td></tr>
-        <tr><td><code>batches_handed_to_send_queue</code></td><td>Durable Object 已经写成批次并投递给 <code>send-queue-backfill</code> 的精确 batch 数。</td></tr>
-        <tr><td><code>log_lines_handed_to_send_queue</code></td><td>上述 batch 里的精确日志总条数。对账时优先看这个数字。</td></tr>
-        <tr><td><code>line_count_status</code></td><td><code>exact</code> 表示上面的日志总条数是精确值；<code>not_available_for_legacy_run</code> 表示这个 run 启动时还没有逐 batch 行数统计。</td></tr>
-        <tr><td><code>average_lines_per_batch</code></td><td>每个已发出 batch 的平均行数，只是辅助视图；精确总量仍然看 <code>log_lines_handed_to_send_queue</code>。</td></tr>
-        <tr><td><code>smallest_batch_lines</code> / <code>largest_batch_lines</code></td><td>当前已经发出的 batch 里，最小和最大的实际行数。</td></tr>
-        <tr><td><code>batches_still_buffered_in_worker</code> / <code>lines_still_buffered_in_worker</code></td><td>DO 内还没 flush 进 send queue 的批次数和缓冲行数。</td></tr>
-      </table>
-      <div class="tip">
-        attempt 级的 ACK / queue-wait 指标已经不再持久化。原因是 retry、晚到重复消息、timeout 语义都可能让这些数字和“实际客户侧收到多少”产生偏差，不适合作为对账真相源。
-      </div>
-      <div class="tip ok">
-        看 sender 健康度时，用 Worker 日志和 Queue backlog；看 Worker 侧已经交给 send queue 的精确量时，用 <code>batches_handed_to_send_queue</code> 和 <code>log_lines_handed_to_send_queue</code>。
-      </div>
-      <div class="tip warn">
-        如果是在一个已经跑起来的旧版本 run 中途升级到这个版本，<code>aggregate.line_count_tracking</code> 可能会显示 <code>unavailable_legacy_run</code>。这表示历史 batch 生成时还没有保存逐批行数，所以精确总条数只能从这个版本开始的新 run 提供。
-      </div>
-    </div>
-  </section>
+  <p>运维上请以 queue backlog 和 sender 日志为准。sender 日志里会带 <code>ack_ms</code> 和 <code>queue_wait_ms</code>。</p>
 
-  <section class="section" id="tuning">
-    <h2 class="title">调速</h2>
-    <div class="card">
-      <p>当前仓库配置的发送速度上限参数对应关系：</p>
-      <table>
-        <tr><th>参数</th><th>直白解释</th></tr>
-        <tr><td><code>BATCH_SIZE = 1000</code></td><td>每次 POST 最多带 <code>1000</code> 条日志。</td></tr>
-        <tr><td><code>max_concurrency = 10</code></td><td>同时最多允许 <code>10</code> 个 sender invocation 在跑。</td></tr>
-        <tr><td><code>max_batch_size = 1</code></td><td>每个 sender invocation 只处理 <code>1</code> 个 send queue message，也就是大致只发 <code>1</code> 个 POST。</td></tr>
-        <tr><td><code>MIN_SENDER_INVOCATION_MS = 200</code></td><td>每个 invocation 至少占用 <code>200ms</code>，对应每秒最多 <code>5</code> 次发送。</td></tr>
-      </table>
-      <pre><code>lines/s 上限
-= max_concurrency × max_batch_size × (1000 / MIN_SENDER_INVOCATION_MS) × BATCH_SIZE
-= 10 × 1 × 5 × 1000
-= 50000 行/秒</code></pre>
-      <p>如果客户 ACK 时间超过 200ms，实际速率仍会低于这个上限，但这就是当前 checked-in 配置对应的理论 ceiling。</p>
-      <div class="tip warn">
-        调速建议顺序：优先逐步提高 sender 的 <code>max_concurrency</code>，并先保持 <code>max_batch_size = 1</code> 不变；只有在客户 endpoint 已经证明能稳定承受更高并发时，再考虑动 <code>max_batch_size</code>。
-      </div>
-      <table>
-        <tr><th>目标 ceiling</th><th>推荐设置</th><th>说明</th></tr>
-        <tr><td>5,000 行/秒</td><td><code>max_concurrency = 1</code></td><td>对客户接收端冲击最小。</td></tr>
-        <tr><td>10,000 行/秒</td><td><code>max_concurrency = 2</code></td><td>如果 ACK 长期在数百毫秒，适合作为第一档。</td></tr>
-        <tr><td>20,000 行/秒</td><td><code>max_concurrency = 4</code></td><td>仍然容易理解：一个 invocation 大致对应一个 POST。</td></tr>
-        <tr><td>30,000 行/秒</td><td><code>max_concurrency = 6</code></td><td>要开始重点盯 Queue backlog 和客户侧入库情况。</td></tr>
-        <tr><td>40,000 行/秒</td><td><code>max_concurrency = 8</code></td><td>建议在 30k 稳定后再提高。</td></tr>
-        <tr><td>50,000 行/秒</td><td><code>max_concurrency = 10</code></td><td>当前仓库配置示例。</td></tr>
-      </table>
-      <p>提高 <code>BACKFILL_RATE</code> 只会更快把 raw 文件送进 parser，不会改变最终 sender ceiling。</p>
-    </div>
-  </section>
-
-  <section class="section" id="cleanup">
-    <h2 class="title">清理</h2>
-    <div class="card">
-      <p>当满足以下条件时，Backfill 会自动清理临时文件：</p>
-      <ul>
-        <li><code>status = done</code></li>
-        <li><code>processed-backfill/&lt;run-id&gt;/</code> 下已经没有待发送的 <code>.txt</code> 或 <code>.queued</code> 文件</li>
-        <li>经过约 1 天的安全等待期</li>
-      </ul>
-      <p>自动删除的内容：</p>
-      <ul>
-        <li><code>processed-backfill/&lt;run-id&gt;/</code> 下的所有临时批次文件与 <code>.done</code> 标记</li>
-        <li>旧版本遗留的 <code>backfill-state/send-stats.json</code>（如果存在）</li>
-      </ul>
-      <div class="tip">
-        为了防止同一配置在 Worker 还部署着时自动重跑，<code>backfill-state/progress.json</code> 会压缩成一个很小的完成标记并继续保留。等 Backfill Worker 不再需要时，删除 Worker 后再删这个小文件即可。
-      </div>
-    </div>
-  </section>
-
-  <section class="section" id="faq">
-    <h2 class="title">FAQ</h2>
-    <div class="card">
-      <p><strong>Q: 这套 backfill 会影响生产吗？</strong></p>
-      <p>A: 它不会共享生产的 Queue 和 processed 前缀，因此不会阻塞或污染生产的 CF 内部链路。但它仍然 POST 到同一个客户 endpoint，所以会增加一小部分补传流量。</p>
-      <p><strong>Q: 怎么判断补传真的结束了？</strong></p>
-      <p>A: 同时满足：<code>/backfill/status</code> 显示 <code>status = done/cleaned</code>，并且 <code>send-queue-backfill</code> backlog 归零。</p>
-      <p><strong>Q: 如果客户 ACK 很慢怎么办？</strong></p>
-      <p>A: 优先增大 <code>SEND_TIMEOUT_MS</code>，减少“客户其实收到了，但 ACK 回得慢，导致误 retry”的概率。</p>
-    </div>
-  </section>
-</div>
-
-<footer>
-  CTYun Logpush Backfill Guide · Cloudflare China Network
-</footer>
+  <h2>什么时候算结束</h2>
+  <p>最稳妥的判断条件：</p>
+  <ul>
+    <li><code>/backfill/status</code> 显示 <code>status = done</code> 或 <code>cleaned</code></li>
+    <li><code>send-queue-backfill</code> backlog 归零</li>
+  </ul>
 </body>
 </html>
