@@ -1341,23 +1341,20 @@ function buildPublicStatusResponse(state, artifactStats, env) {
       : '只有 fully_completed=true 才算彻底补传完成。当前如果只是 delivery_completed=true，说明日志已经发完，但临时文件可能还在等待自动清理。',
     run_id: state.run_id,
     replay_window_beijing: `${toBeijingTime(state.config?.start)} ~ ${toBeijingTime(state.config?.end)}`,
-    task_window_start_beijing: toBeijingTime(state.config?.start),
-    task_window_end_beijing: toBeijingTime(state.config?.end),
     task_started_beijing: toBeijingTime(state.started_at),
     raw_file_scan_finished_beijing: toBeijingTime(state.completed_at),
     last_refresh_beijing: toBeijingTime(lastUpdatedAt),
     matched_raw_files: state.enqueued_count ?? 0,
-    raw_file_scan_rate_limit_per_minute: state.config?.rate ?? null,
     batches_sent: artifactStats.sent_batches,
     batches_pending: artifactStats.pending_batches,
     log_lines_sent: artifactStats.sent_lines,
-    log_lines_pending: artifactStats.pending_lines,
     batch_size_max_configured: artifactStats.configured_batch_size,
     batch_lines_avg: artifactStats.avg_batch_lines,
     batch_lines_min: artifactStats.min_batch_lines,
     batch_lines_max: artifactStats.max_batch_lines,
     batch_size_note: buildBatchSizeNote(artifactStats),
-    cleanup: state.cleanup,
+    cleanup_status: state.cleanup?.status || null,
+    cleanup_status_explained: explainCleanupStatus(state.cleanup?.status),
     rerun_same_window_how: '如果同一时间窗需要重新跑，请先删除 R2 里的 backfill-state/progress.json 和 backfill-state/status.json，再保持 BACKFILL_ENABLED=true 重新部署或等待下一次 cron。旧 run 的 processed-backfill/<run-id>/ 不会影响新 run。',
     r2_console_note: 'R2 Dashboard 里 progress.json 或 status.json 的 Date Created 不是这次 run 是否最新的判断依据。请看 task_started_beijing、raw_file_scan_finished_beijing、last_refresh_beijing。',
   };
@@ -1384,6 +1381,14 @@ function explainStage(stage) {
   if (stage === 'sent_waiting_cleanup') return '所有 batch 都已经发完，当前只是等待自动清理临时文件。';
   if (stage === 'cleaned') return '临时文件也已经清理完，这次 backfill 已经彻底结束。';
   return '当前阶段未知。';
+}
+
+function explainCleanupStatus(status) {
+  if (status === 'pending') return '临时文件还没进入清理等待阶段。';
+  if (status === 'ready') return '日志已经发完，当前只是在等待自动清理临时文件。';
+  if (status === 'deleting') return '系统正在删除临时文件。';
+  if (status === 'done') return '临时文件已经清理完。';
+  return '当前没有额外清理信息。';
 }
 
 function buildBatchSizeNote(artifactStats) {
@@ -1437,6 +1442,9 @@ export const __test = {
   createEmptyArtifactStats,
   createInitialCleanupState,
   derivePublicStage,
+  explainCleanupStatus,
+  explainStage,
+  explainStatus,
   extractBatchLineCountFromKey,
   extractFileTimeRange,
   getBatchPrefix,

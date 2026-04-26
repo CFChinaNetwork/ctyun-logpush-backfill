@@ -307,4 +307,7 @@ test('buildPublicStatusResponse returns a human-friendly reconciliation view', (
   assert.match(response.batch_size_note, /不是固定 1000 条/);
   assert.equal(response.fully_completed, false);
   assert.equal(response.delivery_completed, true);
+  assert.equal(response.cleanup_status, 'ready');
+  assert.match(response.cleanup_status_explained, /等待自动清理/);
+  assert.equal(response.task_window_start_beijing, undefined);
 });

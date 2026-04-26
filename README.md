@@ -80,10 +80,10 @@ Key status fields:
 - `last_refresh_beijing`
 - `matched_raw_files`
 - `batches_sent` / `batches_pending`
-- `log_lines_sent` / `log_lines_pending`
+- `log_lines_sent`
 - `batch_lines_avg` / `batch_lines_min` / `batch_lines_max`
 - `batch_size_note`
-- `cleanup`
+- `cleanup_status` / `cleanup_status_explained`
 - `rerun_same_window_how`
 - `r2_console_note`
 
