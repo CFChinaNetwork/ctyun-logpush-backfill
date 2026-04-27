@@ -75,7 +75,7 @@ WorkerSubrequest === true   // explicit subrequest flag</code></pre>
     <li>Only top-level requests are forwarded: <code>ParentRayID = "00"</code> and <code>WorkerSubrequest != true</code></li>
     <li>Authenticated POSTs using the same CTYun secrets as production</li>
     <li>Sender-side rate cap through queue concurrency + a 200ms per-invocation floor</li>
-    <li>Temporary batch files are cleaned automatically after the run completes (24h grace period)</li>
+    <li>Temporary batch files are cleaned automatically after the run completes (2h grace period)</li>
   </ul>
 
   <h2>Deploy</h2>
@@ -174,11 +174,11 @@ wrangler deploy --config wrangler-backfill.toml</code></pre>
   <ol>
     <li><code>inspectRunArtifacts</code> &mdash; list every batch artifact and verify <code>.done</code> exists</li>
     <li><code>cleanup.status = ready</code> &mdash; entered when all artifacts confirmed sent</li>
-    <li><strong>24-hour grace period</strong> &mdash; temporary files retained for inspection</li>
+    <li><strong>2-hour grace period</strong> &mdash; temporary files retained for inspection</li>
     <li><code>cleanup.status = deleting</code> &mdash; bulk delete <code>processed-backfill/&lt;run-id&gt;/*</code></li>
     <li><code>cleanup.status = done</code> &mdash; state marked <code>cleaned</code>, run is fully complete</li>
   </ol>
-  <p>The grace period is intentional: it gives operators a window to inspect what was sent before files are removed.</p>
+  <p>The grace period is intentional: it gives operators a short window to inspect what was sent before files are removed.</p>
 
   <h2>Re-running the Same Time Window</h2>
   <p>If you need to replay the exact same <code>[A, B]</code> window after a successful run:</p>

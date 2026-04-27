@@ -41,6 +41,27 @@ function createFakeBucket() {
   };
 }
 
+function createBucketWithTransientDeleteFailures(failures = {}) {
+  const RAW_BUCKET = createFakeBucket();
+  const deleteAttempts = new Map();
+
+  RAW_BUCKET.delete = async (key) => {
+    if (Array.isArray(key)) {
+      await Promise.all(key.map((item) => RAW_BUCKET.delete(item)));
+      return;
+    }
+
+    const attempt = (deleteAttempts.get(key) || 0) + 1;
+    deleteAttempts.set(key, attempt);
+    if (attempt <= (failures[key] || 0)) {
+      throw new Error('transient delete');
+    }
+    RAW_BUCKET.objects.delete(key);
+  };
+
+  return { RAW_BUCKET, deleteAttempts };
+}
+
 test('record window clipping keeps only records inside [start, end]', () => {
   const run = { startMs: 1000, endMs: 2000 };
 
@@ -165,6 +186,84 @@ test('writeBatchAndEnqueue skips batches already marked done', async () => {
 
   assert.equal(sent.length, 0);
   assert.equal(RAW_BUCKET.objects.has(batchKey), false);
+});
+
+test('deleteBatchArtifactsWithRetry retries transient delete failures until artifacts disappear', async () => {
+  const batchKey = 'processed-backfill/run-1/batch-1-n1000.txt';
+  const queuedKey = `${batchKey}.queued`;
+  const { RAW_BUCKET, deleteAttempts } = createBucketWithTransientDeleteFailures({
+    [batchKey]: 1,
+    [queuedKey]: 2,
+  });
+  RAW_BUCKET.objects.set(batchKey, 'body');
+  RAW_BUCKET.objects.set(queuedKey, '1');
+
+  const result = await __test.deleteBatchArtifactsWithRetry({ RAW_BUCKET }, batchKey, queuedKey);
+
+  assert.deepEqual(result, {
+    ok: true,
+    attempts: 3,
+    batchDeleted: true,
+    queuedDeleted: true,
+    remaining: [],
+  });
+  assert.equal(deleteAttempts.get(batchKey), 2);
+  assert.equal(deleteAttempts.get(queuedKey), 3);
+  assert.equal(RAW_BUCKET.objects.has(batchKey), false);
+  assert.equal(RAW_BUCKET.objects.has(queuedKey), false);
+});
+
+test('deleteBatchArtifactsWithRetry reports leftovers without throwing when delete keeps failing', async () => {
+  const batchKey = 'processed-backfill/run-1/batch-2-n1000.txt';
+  const queuedKey = `${batchKey}.queued`;
+  const { RAW_BUCKET } = createBucketWithTransientDeleteFailures({
+    [batchKey]: 10,
+    [queuedKey]: 10,
+  });
+  RAW_BUCKET.objects.set(batchKey, 'body');
+  RAW_BUCKET.objects.set(queuedKey, '1');
+
+  const result = await __test.deleteBatchArtifactsWithRetry({ RAW_BUCKET }, batchKey, queuedKey);
+
+  assert.deepEqual(result, {
+    ok: false,
+    attempts: 3,
+    batchDeleted: false,
+    queuedDeleted: false,
+    remaining: [batchKey, queuedKey],
+  });
+  assert.equal(RAW_BUCKET.objects.has(batchKey), true);
+  assert.equal(RAW_BUCKET.objects.has(queuedKey), true);
+});
+
+test('writeBatchAndEnqueue retries rollback deletion when queue send fails', async () => {
+  const sourceKey = 'logs/20260422/file.log.gz';
+  const run = { id: '20260422T140000Z_20260422T143000Z' };
+  const batchKey = __test.buildBatchKey(sourceKey, 0, run.id, 1);
+  const queuedKey = `${batchKey}.queued`;
+  const { RAW_BUCKET, deleteAttempts } = createBucketWithTransientDeleteFailures({
+    [batchKey]: 1,
+    [queuedKey]: 1,
+  });
+  const env = {
+    RAW_BUCKET,
+    LOG_LEVEL: 'error',
+    SEND_QUEUE: {
+      async send() {
+        throw new Error('queue down');
+      },
+    },
+  };
+
+  await assert.rejects(
+    __test.writeBatchAndEnqueue(['line-1'], sourceKey, 0, env, run),
+    /queue down/
+  );
+
+  assert.equal(deleteAttempts.get(batchKey), 2);
+  assert.equal(deleteAttempts.get(queuedKey), 2);
+  assert.equal(RAW_BUCKET.objects.has(batchKey), false);
+  assert.equal(RAW_BUCKET.objects.has(queuedKey), false);
 });
 
 test('resolveRunContext falls back to persisted state.run_id for legacy queue messages', async () => {

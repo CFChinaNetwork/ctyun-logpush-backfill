@@ -163,7 +163,7 @@ const STATE_KEY               = 'backfill-state/progress.json'; // 内部 progre
 const STATUS_KEY              = 'backfill-state/status.json';   // 对外人话版 status
 const MAX_RANGE_HOURS         = 24 * 7;                    // 最大 7 天回放窗口
 const WALL_TIME_BUDGET_MS     = 55_000;                    // 单次 cron 不超过 55s（cron 周期 60s）
-const CLEANUP_GRACE_MS        = 24 * 60 * 60_000;          // delivery_completed 后等 24h 才删 artifact
+const CLEANUP_GRACE_MS        = 2 * 60 * 60_000;           // delivery_completed 后等 2h 才删 artifact
 const MAX_RATE                = 100;                       // BACKFILL_RATE 上限（files/cron-min）
 const DEFAULT_RATE            = 5;                         // BACKFILL_RATE 默认值（保守）
 const LIST_LIMIT              = 1000;                      // R2 list 单页 size
@@ -171,6 +171,8 @@ const MAX_DAY_PREFIXES        = 10;                        // 防止跨日 prefi
 const DEFAULT_SEND_TIMEOUT_MS = 300_000;                   // 5 min — 故意宽松，最小化 abort 引起的翻倍
 const MIN_SEND_TIMEOUT_MS     = 1_000;
 const DEFAULT_BATCH_SIZE      = 1000;                      // 每次 POST 1000 行
+const DELETE_RETRY_ATTEMPTS   = 3;                         // delete 失败时最多重试 3 次
+const DELETE_RETRY_DELAY_MS   = 100;                       // 100ms / 200ms / 300ms 退避
 const LOG_LEVELS             = Object.freeze({ debug: 0, info: 1, warn: 2, error: 3 });
 
 // ─── Sender 限速：单 invocation 至少 200ms（设计来防止 ACK 极快时超过 receiver cap）
@@ -364,11 +366,13 @@ async function writeBatchAndEnqueue(lines, sourceKey, index, env, run) {
       lineCount: lines.length,
     });
   } catch (error) {
-    // 任何一步失败都 rollback，避免留孤立资源
-    await Promise.allSettled([
-      env.RAW_BUCKET.delete(batchKey),
-      env.RAW_BUCKET.delete(queuedMarkerKey),
-    ]);
+    // 任何一步失败都 rollback，避免留孤立 .txt / .queued。
+    // R2 delete 偶发失败时，这里做读后核验 + 重试，尽量不要让后续 run 卡在 pending。
+    // 这里沿用原有前提：Queue.send() resolve=已入队，throw=未入队，因此 send 失败时可回滚。
+    const rollback = await deleteBatchArtifactsWithRetry(env, batchKey, queuedMarkerKey);
+    if (!rollback.ok) {
+      log(env, 'error', `Parser rollback left orphan artifacts after ${rollback.attempts} attempts: ${rollback.remaining.join(', ')} | root_error=${error.message}`);
+    }
     throw error;
   }
 
@@ -499,17 +503,13 @@ async function sendBatch(msg, env) {
   const wroteDone = await writeDoneMarkerWithRetry(env, key);
 
   if (wroteDone) {
-    await Promise.allSettled([
-      env.RAW_BUCKET.delete(key),
-      env.RAW_BUCKET.delete(queuedMarkerKey),
-    ]).then((results) => {
-      if (results[0].status === 'rejected') {
-        log(env, 'warn', `Delete failed (will be cleaned by lifecycle): ${key}: ${results[0].reason?.message || results[0].reason}`);
-      }
-      if (results[1].status === 'rejected') {
-        log(env, 'warn', `Queued marker cleanup failed: ${queuedMarkerKey}: ${results[1].reason?.message || results[1].reason}`);
-      }
-    });
+    const cleanup = await deleteBatchArtifactsWithRetry(env, key, queuedMarkerKey);
+    if (!cleanup.batchDeleted) {
+      log(env, 'warn', `Delete failed after ${cleanup.attempts} attempts (will be cleaned later): ${key}`);
+    }
+    if (!cleanup.queuedDeleted) {
+      log(env, 'warn', `Queued marker cleanup failed after ${cleanup.attempts} attempts: ${queuedMarkerKey}`);
+    }
   } else {
     log(env, 'error', `Successful POST but failed to persist .done marker after retries: ${key}`);
     throw new Error(`POST succeeded but .done marker could not be persisted for ${key}`);
@@ -519,7 +519,7 @@ async function sendBatch(msg, env) {
 // ─── Cron / Scheduled Handler ───────────────────────────────────────────────
 // 每分钟一次。两个职责：
 //   (a) phase=enqueue 阶段：扫 R2 logs/YYYYMMDD/ 把窗口内文件入 parse-queue
-//   (b) status=done 阶段：跑 cleanup 状态机（inspect → ready → 24h grace → delete）
+//   (b) status=done 阶段：跑 cleanup 状态机（inspect → ready → 2h grace → delete）
 //
 // 单次 cron 不超过 WALL_TIME_BUDGET_MS = 55s（cron 周期 60s）。
 // 跨 cron 用 R2 上的 backfill-state/progress.json 持久化进度，中断不丢数据。
@@ -758,7 +758,7 @@ async function runEnqueue(env, state, config, startedAt) {
 // 在 enqueue 完成后，按以下状态机清理 processed-backfill/<run-id>/ 临时文件：
 //
 //   pending  → inspectRunArtifacts: 列所有 artifact 并验证 .done 都存在
-//   ready    → 24h grace period 等待运维方检查
+//   ready    → 2h grace period 等待运维方检查
 //   deleting → deleteRunArtifacts: 批量删除所有 artifact
 //   done     → 标记 state.status='cleaned'，run 彻底完成
 //
@@ -775,7 +775,7 @@ async function maybeAutoCleanup(env, state, startedAt) {
     return false;
   }
 
-  // ready → 等 24h grace 后才进入 deleting
+  // ready → 等 2h grace 后才进入 deleting
   if (state.cleanup.status === 'ready') {
     const readyAt = Date.parse(state.cleanup.ready_at || '');
     if (Number.isFinite(readyAt) && Date.now() - readyAt < CLEANUP_GRACE_MS) return false;
@@ -1308,6 +1308,41 @@ function parsePositiveInt(raw, fallback, min) {
   return parsed;
 }
 
+// 删除 batch 正文和 .queued 时做读后核验。这里不改变主流程，只在 delete 偶发失败时
+// 重试几次，尽量不要留下没有 .done 的孤儿 artifact。
+async function deleteBatchArtifactsWithRetry(env, batchKey, queuedMarkerKey, attempts = DELETE_RETRY_ATTEMPTS) {
+  let batchDeleted = false;
+  let queuedDeleted = false;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    await Promise.allSettled([
+      batchDeleted ? Promise.resolve() : env.RAW_BUCKET.delete(batchKey),
+      queuedDeleted ? Promise.resolve() : env.RAW_BUCKET.delete(queuedMarkerKey),
+    ]);
+
+    const [batchHead, queuedHead] = await Promise.all([
+      batchDeleted ? null : env.RAW_BUCKET.head(batchKey).catch(() => ({ key: batchKey })),
+      queuedDeleted ? null : env.RAW_BUCKET.head(queuedMarkerKey).catch(() => ({ key: queuedMarkerKey })),
+    ]);
+
+    batchDeleted = batchDeleted || !batchHead;
+    queuedDeleted = queuedDeleted || !queuedHead;
+
+    if (batchDeleted && queuedDeleted) {
+      return { ok: true, attempts: attempt, batchDeleted: true, queuedDeleted: true, remaining: [] };
+    }
+
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * DELETE_RETRY_DELAY_MS));
+    }
+  }
+
+  const remaining = [];
+  if (!batchDeleted) remaining.push(batchKey);
+  if (!queuedDeleted) remaining.push(queuedMarkerKey);
+  return { ok: false, attempts, batchDeleted, queuedDeleted, remaining };
+}
+
 // 客户业务约束：只发送顶层请求（不发 Worker 子请求 / fetch subrequest 日志）。
 // 两个判据同时成立才保留：
 //   - ParentRayID === "00"：表示这是一个父请求（无 parent ray）
@@ -1708,6 +1743,7 @@ export const __test = {
   compactStateAfterCleanup,
   createEmptyArtifactStats,
   createInitialCleanupState,
+  deleteBatchArtifactsWithRetry,
   derivePublicStage,
   explainCleanupStatus,
   explainStage,

@@ -75,7 +75,7 @@ WorkerSubrequest === true   // 显式子请求标记</code></pre>
     <li>只发送父请求：<code>ParentRayID = "00"</code> 且 <code>WorkerSubrequest != true</code></li>
     <li>使用和生产一致的 CTYun 鉴权 secrets 做 POST</li>
     <li>通过 queue 并发 + 200ms invocation floor 对 sender 做显式限速</li>
-    <li>run 完成后自动清理临时 batch 文件（24 小时宽限）</li>
+    <li>run 完成后自动清理临时 batch 文件（2 小时宽限）</li>
   </ul>
 
   <h2>部署</h2>
@@ -174,7 +174,7 @@ wrangler deploy --config wrangler-backfill.toml</code></pre>
   <ol>
     <li><code>inspectRunArtifacts</code> &mdash; list 所有 batch artifact 并核实 <code>.done</code> 都存在</li>
     <li><code>cleanup.status = ready</code> &mdash; 全部确认已发送后进入此状态</li>
-    <li><strong>24 小时宽限期</strong> &mdash; 临时文件保留供检查</li>
+    <li><strong>2 小时宽限期</strong> &mdash; 临时文件保留供检查</li>
     <li><code>cleanup.status = deleting</code> &mdash; 批量删除 <code>processed-backfill/&lt;run-id&gt;/*</code></li>
     <li><code>cleanup.status = done</code> &mdash; state 标记为 <code>cleaned</code>，run 彻底完成</li>
   </ol>
