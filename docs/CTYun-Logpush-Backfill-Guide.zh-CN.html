@@ -189,6 +189,15 @@ wrangler r2 object delete cdn-logs-raw/backfill-state/status.json
 # 2. 重新部署，或等待下一次 cron（保持 BACKFILL_ENABLED="true"）</code></pre>
   <p>旧的 <code>processed-backfill/&lt;run-id&gt;/</code> 前缀<strong>不会</strong>阻塞新的 run &mdash; 每次 run 用新的 <code>run_id</code>（带时间戳后缀）。</p>
 
+  <h2>同一域名跑不同时间窗</h2>
+  <p>这是正常的重复补传路径。只要上一轮已经进入 <code>cleaned</code>（或 <code>fully_completed = true</code>），直接修改 <code>BACKFILL_START_TIME</code> / <code>BACKFILL_END_TIME</code> 后重新部署即可。</p>
+  <ul>
+    <li>不需要手动删除旧的 <code>processed-backfill/&lt;old-run-id&gt;/</code></li>
+    <li>不需要手动删除 <code>backfill-state/progress.json</code> / <code>status.json</code></li>
+    <li>正常路径下也不需要手动清空 queue</li>
+  </ul>
+  <p>只有当上一轮已经是 <code>cleaned</code> 时，Worker 才会自动按新时间窗初始化下一轮。如果上一轮还是 <code>running</code> / <code>done</code>，不要立刻切换时间窗。</p>
+
   <h2>什么时候算结束</h2>
   <p>最稳妥的判断条件：</p>
   <ul>

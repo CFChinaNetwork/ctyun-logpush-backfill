@@ -189,6 +189,15 @@ wrangler r2 object delete cdn-logs-raw/backfill-state/status.json
 # 2. Either redeploy, or wait for the next cron tick (BACKFILL_ENABLED stays "true")</code></pre>
   <p>Old <code>processed-backfill/&lt;run-id&gt;/</code> prefixes do <strong>not</strong> block a fresh run &mdash; each run uses a new <code>run_id</code> (timestamp-suffixed).</p>
 
+  <h2>Running a Different Time Window on the Same Zone</h2>
+  <p>This is the normal repeat-run path. Once the previous run is <code>cleaned</code> (or <code>fully_completed = true</code>), just update <code>BACKFILL_START_TIME</code> / <code>BACKFILL_END_TIME</code> and deploy again.</p>
+  <ul>
+    <li>No manual deletion of <code>processed-backfill/&lt;old-run-id&gt;/</code> is required.</li>
+    <li>No manual deletion of <code>backfill-state/progress.json</code> / <code>status.json</code> is required.</li>
+    <li>No queue draining is required on the normal path.</li>
+  </ul>
+  <p>The Worker only auto-reinitializes when the previous state is already <code>cleaned</code>. If a run is still <code>running</code> / <code>done</code>, do not switch the time window yet.</p>
+
   <h2>Finished?</h2>
   <p>The safest completion rule:</p>
   <ul>

@@ -60,7 +60,18 @@ R2 logs/ -> parse-queue-backfill -> Parser
 wrangler deploy --config wrangler-backfill.toml
 ```
 
-Do not change `BACKFILL_START_TIME` / `BACKFILL_END_TIME` while a run is active. Wait until `/backfill/status` reports `fully_completed = true` first.
+Do not change `BACKFILL_START_TIME` / `BACKFILL_END_TIME` while a run is active. Wait until `/backfill/status` reports `status_code = cleaned` (or `fully_completed = true`) first.
+
+## Repeat Runs
+
+For a **different** time window on the same zone, once the previous run is `cleaned` you only need to:
+
+1. Update `BACKFILL_START_TIME` / `BACKFILL_END_TIME`
+2. Deploy again
+
+No manual deletion of old `processed-backfill/<run-id>/`, `backfill-state/*.json`, or queue backlogs is required for this normal path. Temporary batch artifacts are cleaned automatically about **2 hours** after delivery completes.
+
+For the **same** time window (forced replay of the exact same `[A, B]`), delete `backfill-state/progress.json` and `backfill-state/status.json` first, then redeploy or wait for the next cron tick.
 
 ## Monitoring
 
@@ -78,6 +89,8 @@ Files in `backfill-state/`:
 
 - `progress.json` — updated every cron tick (~1/min), always present after a run starts
 - `status.json` — written **only** when someone hits `GET /backfill/status` (does not exist if never queried)
+
+`processed-backfill/<run-id>/` is temporary. Once all batches are confirmed sent, the Worker waits **2 hours** and then deletes that run's temporary artifacts automatically.
 
 `send-stats.json` does **not** exist in the current code. Per-batch `ack_ms` and `queue_wait_ms` are emitted to Worker logs only, not aggregated into R2. See the guides below for the full field list, tuning table, and re-run / cleanup details.
 
