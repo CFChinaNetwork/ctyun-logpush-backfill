@@ -329,6 +329,18 @@ test('queue wait math and cleanup state helpers stay stable', async () => {
   const compacted = __test.compactStateAfterCleanup({
     config: { start: 'a', end: 'b', rate: 100 },
     run_id: 'run-1',
+    artifact_stats_snapshot: {
+      total_batches: 3,
+      sent_batches: 3,
+      pending_batches: 0,
+      total_lines: 1800,
+      sent_lines: 1800,
+      pending_lines: 0,
+      min_batch_lines: 300,
+      max_batch_lines: 1000,
+      avg_batch_lines: 600,
+      configured_batch_size: 1000,
+    },
     started_at: '2026-04-24T03:00:00.000Z',
     completed_at: '2026-04-24T04:00:00.000Z',
     enqueued_count: 42,
@@ -337,6 +349,7 @@ test('queue wait math and cleanup state helpers stay stable', async () => {
   });
   assert.equal(compacted.status, 'cleaned');
   assert.equal(compacted.cleanup.deleted_objects, 10);
+  assert.equal(compacted.artifact_stats_snapshot.sent_batches, 3);
 
   const RAW_BUCKET = createFakeBucket();
   RAW_BUCKET.objects.set('backfill-state/progress.json', JSON.stringify({ run_id: 'run-1', status: 'cleaned' }));
@@ -409,4 +422,52 @@ test('buildPublicStatusResponse returns a human-friendly reconciliation view', (
   assert.equal(response.cleanup_status, 'ready');
   assert.match(response.cleanup_status_explained, /等待自动清理/);
   assert.equal(response.task_window_start_beijing, undefined);
+});
+
+test('buildPublicStatusResponse falls back to persisted artifact stats after cleanup deletes artifacts', () => {
+  const response = __test.buildPublicStatusResponse({
+    status: 'cleaned',
+    phase: 'done',
+    run_id: 'run-1',
+    config: {
+      start: '2026-04-25T10:40:00+08:00',
+      end: '2026-04-25T11:00:00+08:00',
+      rate: 100,
+    },
+    started_at: '2026-04-26T02:30:38.951Z',
+    updated_at: '2026-04-26T04:30:43.484Z',
+    completed_at: '2026-04-26T02:30:42.416Z',
+    enqueued_count: 173,
+    artifact_stats_snapshot: {
+      total_batches: 12,
+      sent_batches: 12,
+      pending_batches: 0,
+      total_lines: 8456,
+      sent_lines: 8456,
+      pending_lines: 0,
+      min_batch_lines: 56,
+      max_batch_lines: 1000,
+      avg_batch_lines: 704.67,
+      configured_batch_size: 1000,
+    },
+    cleanup: { status: 'done', ready_at: '2026-04-26T03:00:00.000Z' },
+  }, {
+    total_batches: 0,
+    sent_batches: 0,
+    pending_batches: 0,
+    total_lines: 0,
+    sent_lines: 0,
+    pending_lines: 0,
+    min_batch_lines: null,
+    max_batch_lines: null,
+    avg_batch_lines: null,
+    configured_batch_size: 1000,
+  }, { BATCH_SIZE: '1000' });
+
+  assert.equal(response.batches_sent, 12);
+  assert.equal(response.batches_pending, 0);
+  assert.equal(response.log_lines_sent, 8456);
+  assert.equal(response.batch_lines_avg, 704.67);
+  assert.match(response.summary, /发送 12\/12 个 batch/);
+  assert.match(response.summary, /约 8456\/8456 条日志/);
 });

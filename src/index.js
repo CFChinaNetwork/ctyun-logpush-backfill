@@ -779,6 +779,7 @@ async function maybeAutoCleanup(env, state, startedAt) {
   if (state.cleanup.status === 'ready') {
     const readyAt = Date.parse(state.cleanup.ready_at || '');
     if (Number.isFinite(readyAt) && Date.now() - readyAt < CLEANUP_GRACE_MS) return false;
+    await ensureArtifactStatsSnapshot(env, state);
     state.cleanup.status = 'deleting';
     state.cleanup.delete_start_after = null;
     return true;
@@ -1401,6 +1402,7 @@ function compactStateAfterCleanup(state) {
   return {
     config: state.config,
     run_id: state.run_id,
+    artifact_stats_snapshot: state.artifact_stats_snapshot,
     phase: 'done',
     status: 'cleaned',
     started_at: state.started_at,
@@ -1573,6 +1575,48 @@ function createEmptyArtifactStats(batchSize) {
   };
 }
 
+async function ensureArtifactStatsSnapshot(env, state) {
+  if (hasArtifactStatsSnapshot(state?.artifact_stats_snapshot)) return false;
+  state.artifact_stats_snapshot = await collectRunArtifactStats(
+    env,
+    state.run_id,
+    parsePositiveInt(env.BATCH_SIZE, DEFAULT_BATCH_SIZE, 1)
+  );
+  return true;
+}
+
+function hasArtifactStatsSnapshot(stats) {
+  return !!stats
+    && typeof stats === 'object'
+    && Number.isFinite(stats.total_batches)
+    && Number.isFinite(stats.sent_batches)
+    && Number.isFinite(stats.pending_batches)
+    && Number.isFinite(stats.total_lines)
+    && Number.isFinite(stats.sent_lines)
+    && Number.isFinite(stats.pending_lines);
+}
+
+function isArtifactStatsEmpty(stats) {
+  return !stats || (
+    stats.total_batches === 0
+    && stats.sent_batches === 0
+    && stats.pending_batches === 0
+    && stats.total_lines === 0
+    && stats.sent_lines === 0
+    && stats.pending_lines === 0
+  );
+}
+
+// cleaned 阶段的临时 artifacts 会被正常删除，status 需要回退到 cleanup 前保存的快照。
+function resolveStatusArtifactStats(state, artifactStats) {
+  if ((state.status === 'cleaned' || state.cleanup?.status === 'done')
+    && isArtifactStatsEmpty(artifactStats)
+    && hasArtifactStatsSnapshot(state?.artifact_stats_snapshot)) {
+    return state.artifact_stats_snapshot;
+  }
+  return artifactStats;
+}
+
 function derivePublicStage(state, artifactStats) {
   if (state.status === 'cleaned' || state.cleanup?.status === 'done') return 'cleaned';
   if (artifactStats.pending_batches > 0) return 'sending';
@@ -1617,12 +1661,13 @@ function toBeijingTime(value) {
 //   - 北京时间字段（避免运维方误读 UTC）
 //   - explained 字段（每个状态码都附人话解释）
 function buildPublicStatusResponse(state, artifactStats, env) {
-  const stage = derivePublicStage(state, artifactStats);
+  const resolvedArtifactStats = resolveStatusArtifactStats(state, artifactStats);
+  const stage = derivePublicStage(state, resolvedArtifactStats);
   const lastUpdatedAt = state.updated_at || state.last_cron_at || state.completed_at || state.started_at || null;
-  const isDeliveryCompleted = artifactStats.pending_batches === 0 && ['done', 'cleaned'].includes(state.status);
+  const isDeliveryCompleted = resolvedArtifactStats.pending_batches === 0 && ['done', 'cleaned'].includes(state.status);
   const isFullyCompleted = state.status === 'cleaned' || state.cleanup?.status === 'done';
   return {
-    summary: buildHumanMessage(state, artifactStats, stage),
+    summary: buildHumanMessage(state, resolvedArtifactStats, stage),
     status_code: state.status,
     status_explained: explainStatus(state.status),
     stage_code: stage,
@@ -1641,14 +1686,14 @@ function buildPublicStatusResponse(state, artifactStats, env) {
     raw_file_scan_finished_beijing: toBeijingTime(state.completed_at),
     last_refresh_beijing: toBeijingTime(lastUpdatedAt),
     matched_raw_files: state.enqueued_count ?? 0,
-    batches_sent: artifactStats.sent_batches,
-    batches_pending: artifactStats.pending_batches,
-    log_lines_sent: artifactStats.sent_lines,
-    batch_size_max_configured: artifactStats.configured_batch_size,
-    batch_lines_avg: artifactStats.avg_batch_lines,
-    batch_lines_min: artifactStats.min_batch_lines,
-    batch_lines_max: artifactStats.max_batch_lines,
-    batch_size_note: buildBatchSizeNote(artifactStats),
+    batches_sent: resolvedArtifactStats.sent_batches,
+    batches_pending: resolvedArtifactStats.pending_batches,
+    log_lines_sent: resolvedArtifactStats.sent_lines,
+    batch_size_max_configured: resolvedArtifactStats.configured_batch_size,
+    batch_lines_avg: resolvedArtifactStats.avg_batch_lines,
+    batch_lines_min: resolvedArtifactStats.min_batch_lines,
+    batch_lines_max: resolvedArtifactStats.max_batch_lines,
+    batch_size_note: buildBatchSizeNote(resolvedArtifactStats),
     cleanup_status: state.cleanup?.status || null,
     cleanup_status_explained: explainCleanupStatus(state.cleanup?.status),
     rerun_same_window_how: '如果同一时间窗需要重新跑，请先删除 R2 里的 backfill-state/progress.json 和 backfill-state/status.json，再保持 BACKFILL_ENABLED=true 重新部署或等待下一次 cron。旧 run 的 processed-backfill/<run-id>/ 不会影响新 run。',
